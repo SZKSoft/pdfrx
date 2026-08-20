@@ -1,0 +1,8 @@
+name: argus_render_olcum
+description: pdfrx render kuyrugu olcumu
+publish_to: none
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+dependencies:
+  pdfrx_engine:
+    path: C:/Users/soner/StudioProjects/pdfrx/packages/pdfrx_engine

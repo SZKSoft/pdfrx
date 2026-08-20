@@ -321,6 +321,19 @@ class _PdfViewerState extends State<PdfViewer>
   }
 
   void _onDocumentChanged() async {
+    // Cherry-pick of upstream PR #617 (merged 2026-05-08, ships in 2.3.x;
+    // missing from 2.2.24 which is our fork base). The PdfDocumentRef
+    // listenable fires for *every* state change including HTTP
+    // download-progress events for `preferRangeAccess` PDFs — pre-patch
+    // the body below would wipe the image cache + reset
+    // `_initialized` on every chunk. Early-return when the underlying
+    // document instance is unchanged so progress-only notifications
+    // don't trigger a full viewer reset (white-flash reload loop on
+    // 10+ MB PDFs). Not directly load-bearing for ARGUS's RAM-loaded
+    // PDFs but cheap insurance if we switch sources later.
+    final currentDoc = widget.documentRef.resolveListenable().document;
+    if (currentDoc != null && currentDoc == _document) return;
+
     _layout = null;
     _documentSubscription?.cancel();
     _documentSubscription = null;
@@ -334,6 +347,11 @@ class _PdfViewerState extends State<PdfViewer>
     _pageNumber = null;
     _gotoTargetPageNumber = null;
     _initialized = false;
+    // ARGUS fork addition (B1): reset the on-demand load bookkeeping
+    // so a swap to a fresh document doesn't inherit the previous doc's
+    // already-loaded range.
+    _eagerLoadedThroughPage = 0;
+    _progressiveLoadInFlight = null;
     _txController.removeListener(_onMatrixChanged);
     _controller?._attach(null);
 
@@ -366,21 +384,179 @@ class _PdfViewerState extends State<PdfViewer>
     _loadDelayed();
   }
 
+  // 2026-05-14: `_kEagerPageLookahead` constant removed — the
+  // contiguous "ensure pages up through N" path was retired in
+  // favour of `_ensurePageLoadedSparse`, which uses a fixed ±2
+  // radius around the target page. The contiguous loader saw a
+  // ~300 MB RSS spike on long jumps because it dragged PDFium
+  // through every intermediate page (see
+  // `_ensurePageLoadedSparse` docstring for the full rationale).
+  /// Highest page number whose PDFium metadata has been resolved to real
+  /// dimensions. Pages beyond this index still appear in
+  /// `_document.pages` but with placeholder (last-loaded-page) sizes,
+  /// AND `PdfPage.render()` returns `null` for them — so the paint loop
+  /// shows the white fallback rect until the underlying batch tick
+  /// flips `isLoaded` to true.
+  int _eagerLoadedThroughPage = 0;
+
+  /// In-flight progressive load future, or null when idle. Used to
+  /// serialise [_ensurePagesLoadedThrough] callers: a second invocation
+  /// while a load is running awaits the first and re-checks whether
+  /// further loading is needed.
+  Future<void>? _progressiveLoadInFlight;
+
   Future<void> _loadDelayed() async {
     // To make the page image loading more smooth, delay the loading of pages
     await Future.delayed(widget.params.behaviorControlParams.trailingPageLoadingDelay);
+    if (!mounted) return;
+    // ARGUS fork — Phase Y1 (2026-05-14). Bounded initial page-metadata
+    // load.
+    //
+    // **Why bounded**: Phase E1 used to load every page in the document
+    // (`target: 1 << 30`) to dodge the "page renders blank when
+    // `!isLoaded`" symptom. The cost was hidden — every `FPDF_LoadPage`
+    // call inside `_loadPagesInLimitedTime` (see pdfrx_pdfium.dart:~740)
+    // triggers PDFium to parse the page's resource dictionary; the
+    // document-level CPDF cache then holds onto every decoded shading
+    // dict / X-Object form / font resource for the life of the
+    // document. On a 270-page textbook whose source PDF is 47%
+    // shading info (~85 MB compressed, 200-400 MB decoded), pre-loading
+    // every page is the dominant unaccounted RAM cost on a 4 GB smart
+    // board.
+    //
+    // **The fix**: cap the initial sweep at the first window
+    // (initialPage ± 10, min 30). Pages beyond that stay
+    // `!isLoaded` until the user navigates near them
+    // (`_setCurrentPageNumber` extends the window) OR a render call
+    // explicitly waits for them (`_cachePagePreviewImage` now does an
+    // `_ensurePagePageLoadedSync` hop before calling `page.render`,
+    // which means cold-jumps to far pages incur ~250-500 ms instead
+    // of being silently blank).
+    //
+    // **A2 vs B1**: the B1 attempt did the same kind of cap and failed
+    // because it didn't pair with a render-time await. A2's frame
+    // coalescer is independent and remains in effect either way, so
+    // there's no invalidate-storm risk in the bounded path.
+    final int initialTarget = max(30, widget.initialPageNumber + 10);
+    await _ensurePagesLoadedThrough(initialTarget);
+  }
 
-    final stopwatch = Stopwatch()..start();
-    await _document?.loadPagesProgressively(
-      onPageLoadProgress: (pageNumber, totalPageCount, document) {
-        if (document == _document && mounted) {
-          debugPrint('PdfViewer: Loaded page $pageNumber of $totalPageCount in ${stopwatch.elapsedMilliseconds} ms');
-          return true;
+  /// ARGUS fork helper (2026-05-14). Sparse counterpart to
+  /// [_ensurePagesLoadedThrough]. Loads metadata for `[pageNumber-
+  /// radius .. pageNumber+radius]` only — clamped to the document
+  /// bounds and de-duped against already-loaded pages by the engine.
+  ///
+  /// Why this matters: the contiguous version walked PDFium through
+  /// every page between the last-loaded index and the target, which
+  /// on a "Sayfaya Git" jump from page 1 to page 270 fired 240
+  /// `FPDF_LoadPage` calls back-to-back. Each call let PDFium add the
+  /// referenced page's resource dictionary entries into its
+  /// document-level cache, so process RSS climbed from ~500 MB to
+  /// ~800 MB just from the jump. The sparse loader touches at most
+  /// `2 * radius + 1` pages regardless of the navigation distance.
+  Future<void> _ensurePageLoadedSparse(int pageNumber, {int radius = 2}) async {
+    final doc = _document;
+    if (doc == null) return;
+    if (pageNumber < 1 || pageNumber > doc.pages.length) return;
+    final int lo = max(1, pageNumber - radius);
+    final int hi = min(doc.pages.length, pageNumber + radius);
+    final List<int> wanted = <int>[];
+    for (int p = lo; p <= hi; p++) {
+      if (!doc.pages[p - 1].isLoaded) wanted.add(p - 1);
+    }
+    if (wanted.isEmpty) return;
+
+    // Serialise with the contiguous loader (and other sparse calls)
+    // through the same in-flight gate so PDFium's `BackgroundWorker`
+    // never gets two concurrent page-load batches.
+    final pending = _progressiveLoadInFlight;
+    if (pending != null) {
+      await pending;
+      if (!mounted || _document != doc) return;
+      // Re-check after the wait: previous loader may have covered us.
+      final bool stillNeeded =
+          wanted.any((int i) => !doc.pages[i].isLoaded);
+      if (!stillNeeded) return;
+    }
+    final completer = Completer<void>();
+    _progressiveLoadInFlight = completer.future;
+    try {
+      await doc.loadPagesAt(wanted);
+      // Track the highest contiguous index that's now loaded so
+      // subsequent _ensurePagesLoadedThrough callers still benefit
+      // from the bookkeeping. We deliberately DON'T claim full
+      // coverage up to `pageNumber + radius` because intermediate
+      // pages may still be unloaded — the marker is a forward-only
+      // hint, not a strict invariant.
+      if (pageNumber + radius > _eagerLoadedThroughPage) {
+        // Only advance if pages 1..(pageNumber+radius) are actually
+        // all loaded — otherwise leave the marker where it was.
+        bool contiguous = true;
+        for (int p = 1; p <= pageNumber + radius; p++) {
+          if (p - 1 >= doc.pages.length) break;
+          if (!doc.pages[p - 1].isLoaded) {
+            contiguous = false;
+            break;
+          }
         }
-        return false;
-      },
-      data: _document,
-    );
+        if (contiguous) {
+          _eagerLoadedThroughPage = pageNumber + radius;
+        }
+      }
+    } finally {
+      if (_progressiveLoadInFlight == completer.future) {
+        _progressiveLoadInFlight = null;
+      }
+      completer.complete();
+    }
+  }
+
+  /// Ensure PDFium metadata is resolved for pages 1..[target] (1-based,
+  /// inclusive). Safe to call concurrently — overlapping invocations are
+  /// serialised through [_progressiveLoadInFlight].
+  ///
+  /// ARGUS fork helper (2026-05-13, revised 2026-05-14). Caller flow:
+  ///
+  /// - [_loadDelayed]: pulls the initial window into memory.
+  /// - [_setCurrentPageNumber]: extends the window when the user
+  ///   navigates near the unloaded tail.
+  Future<void> _ensurePagesLoadedThrough(int target) async {
+    final doc = _document;
+    if (doc == null) return;
+    if (target <= _eagerLoadedThroughPage) return;
+
+    // Serialise with any in-flight load. Re-check the threshold after
+    // awaiting in case the prior load already covered our range.
+    final pending = _progressiveLoadInFlight;
+    if (pending != null) {
+      await pending;
+      if (target <= _eagerLoadedThroughPage) return;
+      if (!mounted || _document != doc) return;
+    }
+
+    final completer = Completer<void>();
+    _progressiveLoadInFlight = completer.future;
+    try {
+      await doc.loadPagesProgressively<PdfDocument>(
+        data: doc,
+        onPageLoadProgress: (pageCountLoadedTotal, totalPageCount, callbackDoc) {
+          if (!mounted || _document != callbackDoc) return false;
+          if (pageCountLoadedTotal > _eagerLoadedThroughPage) {
+            _eagerLoadedThroughPage = pageCountLoadedTotal;
+          }
+          // Stop once we've covered the requested range OR the entire
+          // document is loaded.
+          if (pageCountLoadedTotal >= target) return false;
+          if (pageCountLoadedTotal >= totalPageCount) return false;
+          return true;
+        },
+      );
+    } finally {
+      if (_progressiveLoadInFlight == completer.future) {
+        _progressiveLoadInFlight = null;
+      }
+      completer.complete();
+    }
   }
 
   void _notifyOnDocumentChanged() {
@@ -902,6 +1078,7 @@ class _PdfViewerState extends State<PdfViewer>
   /// Please note that the function does not scroll/zoom to the specified page but changes the current page number.
   void _setCurrentPageNumber(int? pageNumber, {bool doSetState = false}) {
     if (pageNumber != null && _pageNumber != pageNumber) {
+      debugPrint('[ARGUS-DBG] _setCurrentPageNumber: $_pageNumber -> $pageNumber doSetState=$doSetState');
       _pageNumber = pageNumber;
       if (doSetState) {
         _invalidate();
@@ -909,7 +1086,75 @@ class _PdfViewerState extends State<PdfViewer>
       if (widget.params.onPageChanged != null) {
         Future.microtask(() => widget.params.onPageChanged?.call(_pageNumber));
       }
+      // ARGUS fork (revised 2026-05-14). Sparse pair-with: only the
+      // target page and its ±2 neighbours are dragged through
+      // `FPDF_LoadPage`, not every page between here and the last
+      // contiguous-loaded marker. See `_ensurePageLoadedSparse` for
+      // the rationale (a "Sayfaya Git" jump used to load 200+ pages
+      // sequentially and balloon RSS by ~300 MB).
+      unawaited(_ensurePageLoadedSparse(pageNumber));
+      // ARGUS fork F2 (2026-05-14). Pre-render the ±2 neighbour
+      // pages so they're warm in the in-memory cache (and, via the
+      // E4 pipeline, on disk for next session) before the user
+      // navigates to them. Critical for the viewer's 20 000 pt-gap
+      // single-page layout where the cache-extent never reaches the
+      // adjacent page on its own — without this, every nav button
+      // press goes through a cold PDFium render.
+      _prefetchNeighbourPages(pageNumber);
     }
+  }
+
+  /// ARGUS fork F2 (2026-05-14). Queue preview renders for the pages
+  /// immediately around [currentPageNumber] (±1 then ±2 by priority)
+  /// so navigating to them feels instant. Idempotent and cheap —
+  /// `_cachePagePreviewImage` early-returns when the page is already
+  /// cached at the same scale, and the disk-cache check on miss is
+  /// the same fast path the paint loop uses.
+  void _prefetchNeighbourPages(int currentPageNumber) {
+    final doc = _document;
+    if (doc == null) return;
+    final maxPageNumber = doc.pages.length;
+    // Priority order: nearest first. Out-of-bounds entries are
+    // skipped, so the actual count depends on where the user is.
+    const offsets = [1, -1, 2, -2];
+    for (final delta in offsets) {
+      final n = currentPageNumber + delta;
+      if (n < 1 || n > maxPageNumber) continue;
+      final page = doc.pages[n - 1];
+      // Skip if metadata hasn't landed yet — `PdfPage.render()`
+      // returns null for !isLoaded pages anyway. The eager loader
+      // will catch up shortly, and the next page-change tick will
+      // re-queue this prefetch.
+      if (!page.isLoaded) continue;
+      final scale = _estimatePreviewScaleForPrefetch(page);
+      final width = page.width * scale;
+      final height = page.height * scale;
+      if (width < 1 || height < 1) continue;
+      final existing = _imageCache.pageImages[n];
+      if (existing != null && !existing.isDirty && existing.scale == scale) continue;
+      // Fire-and-forget. `_cachePagePreviewImage` has its own
+      // per-page synchronisation + cancellation token bookkeeping;
+      // concurrent prefetches for different pages just queue up on
+      // the PDFium background worker.
+      unawaited(_cachePagePreviewImage(_imageCache, page, width, height, scale));
+    }
+  }
+
+  /// ARGUS fork F2 helper. Computes the preview scale we'd render
+  /// [page] at if the paint loop reached it — used for the prefetch
+  /// path which doesn't run inside paint and so doesn't have the
+  /// same captured-context closure the paint loop builds. Skips the
+  /// host's `getPageRenderingScale` callback (which would need a
+  /// BuildContext + controller in callback-context); the resulting
+  /// prefetch may render at a slightly different scale than the
+  /// paint loop ends up requesting, in which case paint just
+  /// triggers a re-render — the prefetch was a hint, not a contract.
+  double _estimatePreviewScaleForPrefetch(PdfPage page) {
+    final maxSize = widget.params.onePassRenderingSizeThreshold;
+    if (page.width > maxSize || page.height > maxSize) {
+      return min(maxSize / page.width, maxSize / page.height);
+    }
+    return widget.params.onePassRenderingScaleThreshold;
   }
 
   double _calcPrimaryAxisVisibility(Rect pageRect, Rect viewportRect, bool isHorizontal) {
@@ -928,6 +1173,13 @@ class _PdfViewerState extends State<PdfViewer>
 
   int? _guessCurrentPageNumber() {
     if (_layout == null || _viewSize == null) return null;
+    // ARGUS fork — Phase H8 (2026-05-14). Single-page mode has at
+    // most one non-zero rect in `_layout.pageLayouts`, so the regular
+    // visibility-weighted scan would either spin uselessly over N
+    // zero-rects or just confirm what we already know. Short-circuit.
+    if (widget.params.singlePageMode) {
+      return _pageNumber ?? _gotoTargetPageNumber ?? widget.initialPageNumber;
+    }
     if (widget.params.calculateCurrentPageNumber != null) {
       return widget.params.calculateCurrentPageNumber!(_visibleRect, _layout!.pageLayouts, _controller!);
     }
@@ -1036,13 +1288,81 @@ class _PdfViewerState extends State<PdfViewer>
       _layout = null;
       return false;
     }
-    final newLayout = (widget.params.layoutPages ?? _layoutPages)(_document!.pages, widget.params);
+    // ARGUS fork — Phase H (2026-05-14). `singlePageMode` always wins
+    // over both the user-supplied `params.layoutPages` and the
+    // default multi-page layout — the whole point of the mode is to
+    // bypass per-app workarounds like the "20 000 pt-gap fake
+    // single-page" layout.
+    final PdfPageLayoutFunction layoutFn = widget.params.singlePageMode
+        ? _singlePageLayoutPages
+        : (widget.params.layoutPages ?? _layoutPages);
+    final newLayout = layoutFn(_document!.pages, widget.params);
     if (_layout == newLayout) {
       return false;
     }
 
     _layout = newLayout;
     return true;
+  }
+
+  /// ARGUS fork — Phase H2 (2026-05-14). Lays out every page at the
+  /// shared canonical origin `(margin, margin)` with its own
+  /// dimensions; `documentSize` is sized for the **target page**
+  /// (current/goto-target/initial, whichever applies).
+  ///
+  /// **Why every page gets a real rect (not `Rect.zero`).** Earlier
+  /// drafts of this function used `Rect.zero` for non-target pages so
+  /// the existing `rect.intersect(viewport).isEmpty` check in the
+  /// paint loop would auto-skip them. That worked for paint but broke
+  /// host-app code that reads `pageLayouts[N-1]` directly to convert
+  /// PDF coordinates ↔ doc coordinates (argus's focus/zoom regions,
+  /// drawing overlay, aidf region targets — every one of those
+  /// accessed `controller.layout.pageLayouts[N-1]` for pages OTHER
+  /// than the current one). Returning a valid per-page rect at a
+  /// shared origin gives those callers something sensible (the page's
+  /// page-space → doc-space transform is identity-ish: doc = page +
+  /// (margin, margin)) while we use the new paint-loop short-circuit
+  /// (`widget.params.singlePageMode` branch in
+  /// `_paintPagesCustom`/`_buildPageOverlayWidgets`) to enforce
+  /// single-page visibility.
+  ///
+  /// **Trade-offs.**
+  /// - `documentSize` reflects the TARGET page only; if pages vary in
+  ///   size, navigating between them may visibly reflow on the
+  ///   relayout boundary. Most textbooks are uniform so this is
+  ///   barely noticeable.
+  /// - All pages share centre coordinates, so the geometric
+  ///   eviction-distance metric degenerates. The fork uses
+  ///   `(pageNumber - currentPage.pageNumber).abs()` in single-page
+  ///   mode instead — see `_evictionDistanceFor`.
+  /// - `_isVerticallyMonotone` returns false (all `top == margin`),
+  ///   so `visiblePageRange` falls back to linear scan. The paint
+  ///   loop short-circuits before consulting that anyway.
+  PdfPageLayout _singlePageLayoutPages(List<PdfPage> pages, PdfViewerParams params) {
+    if (pages.isEmpty) {
+      return PdfPageLayout(pageLayouts: const <Rect>[], documentSize: const Size(100, 100));
+    }
+    // While a `goToPage` animation is in flight (`_gotoTargetPageNumber`
+    // set) we size `documentSize` for the DESTINATION so the matrix
+    // can fit it; otherwise the live current page; otherwise the
+    // configured initial page.
+    final int rawTarget =
+        _gotoTargetPageNumber ?? _pageNumber ?? widget.initialPageNumber;
+    final int target = rawTarget.clamp(1, pages.length);
+    final targetPage = pages[target - 1];
+    final double margin = params.margin;
+    final rects = List<Rect>.generate(
+      pages.length,
+      (i) => Rect.fromLTWH(margin, margin, pages[i].width, pages[i].height),
+      growable: false,
+    );
+    return PdfPageLayout(
+      pageLayouts: rects,
+      documentSize: Size(
+        targetPage.width + margin * 2,
+        targetPage.height + margin * 2,
+      ),
+    );
   }
 
   void _calcCoverFitScale() {
@@ -1180,7 +1500,23 @@ class _PdfViewerState extends State<PdfViewer>
     final overlayWidgets = <Widget>[];
     final targetRect = _getCacheExtentRect();
 
-    for (var i = 0; i < _document!.pages.length; i++) {
+    // ARGUS fork — Phase F1 (2026-05-14). See `_paintPagesCustom`
+    // for the rationale; same trick here. Was O(N pages) per build,
+    // now O(visible) thanks to the binary-searched visible range.
+    //
+    // Phase H short-circuit: in single-page mode the layout deliberately
+    // places only one page at non-zero coords, so we know the visible
+    // range a priori without consulting the binary search (which would
+    // fall back to linear anyway because the layout isn't monotone).
+    final ({int begin, int end}) visibleRange;
+    if (widget.params.singlePageMode) {
+      final int n = (_pageNumber ?? _gotoTargetPageNumber ?? widget.initialPageNumber)
+          .clamp(1, _document!.pages.length);
+      visibleRange = (begin: n - 1, end: n);
+    } else {
+      visibleRange = _layout!.visiblePageRange(targetRect);
+    }
+    for (var i = visibleRange.begin; i < visibleRange.end; i++) {
       final rect = _layout!.pageLayouts[i];
       final intersection = rect.intersect(targetRect);
       if (intersection.isEmpty) continue;
@@ -1221,10 +1557,64 @@ class _PdfViewerState extends State<PdfViewer>
             ),
           );
         }
+
+        // ARGUS fork — Phase Y3 (2026-05-14). When a page is visible
+        // but its preview image hasn't landed yet (lazy metadata load
+        // still resolving, PDFium render still queued, or jump-to-page
+        // from far away), `_paintPagesCustom` draws nothing in the
+        // page rect (Phase N6 removed the white fallback). To avoid
+        // leaving the user staring at an empty rectangle, drop a
+        // small centered indeterminate `CircularProgressIndicator`
+        // over the page. As soon as the preview cache fills, the
+        // next invalidate-driven rebuild removes this overlay
+        // automatically because the condition flips.
+        final bool hasPreview =
+            _imageCache.pageImages[page.pageNumber] != null ||
+                _imageCache.pageImagesPartial[page.pageNumber] != null;
+        if (!hasPreview) {
+          final placeholder = widget.params.loadingPlaceholderBuilder?.call(
+                context,
+                page,
+                rectExternal,
+              ) ??
+              _defaultLoadingPlaceholder(context, rectExternal);
+          overlayWidgets.add(
+            Positioned(
+              key: Key('#__pageLoading__:${page.pageNumber}'),
+              left: rectExternal.left,
+              top: rectExternal.top,
+              width: rectExternal.width,
+              height: rectExternal.height,
+              child: IgnorePointer(child: placeholder),
+            ),
+          );
+        }
       }
     }
 
     return [...linkWidgets, ...overlayWidgets];
+  }
+
+  /// Default in-page loading indicator drawn by [_buildPageOverlayWidgets]
+  /// when neither a preview nor a partial render is available yet for a
+  /// visible page. A small centred [CircularProgressIndicator] scaled to
+  /// the page footprint, so wide pages don't get giant spinners.
+  Widget _defaultLoadingPlaceholder(BuildContext context, Rect pageRect) {
+    final double minSide = pageRect.shortestSide;
+    // Indicator is ~6% of the page's shortest side, clamped so it's
+    // legible on thumbnails and not absurdly large on full-page renders.
+    final double indicatorSize = minSide.clamp(40.0, 72.0) * 0.6;
+    final ColorScheme scheme = Theme.of(context).colorScheme;
+    return Center(
+      child: SizedBox(
+        width: indicatorSize,
+        height: indicatorSize,
+        child: CircularProgressIndicator(
+          strokeWidth: 3,
+          valueColor: AlwaysStoppedAnimation<Color>(scheme.primary),
+        ),
+      ),
+    );
   }
 
   void _onSelectionChange() {
@@ -1280,15 +1670,112 @@ class _PdfViewerState extends State<PdfViewer>
     final dropShadowPaint = widget.params.pageDropShadow?.toPaint()?..style = PaintingStyle.fill;
     cacheTargetRect ??= targetRect;
 
-    for (var i = 0; i < _document!.pages.length; i++) {
+    // ARGUS fork — Phase F1 sparse paint loop (2026-05-14).
+    //
+    // The original implementation iterated EVERY page in the document
+    // on every paint just to test `rect.intersect(cacheTargetRect)`.
+    // For a 1000-page PDF at 60 fps that's 60 000 wasted intersect
+    // tests per second of scroll. With the binary-search visible
+    // range from [PdfPageLayout.visiblePageRange] (also a fork
+    // addition) the inner loop becomes O(visible) ≈ 3-5 iterations.
+    //
+    // Off-screen pages still need their pending renders cancelled and
+    // their stale cache entries marked unused — but only the ones
+    // that actually HAVE pending renders or cache entries. We walk
+    // those maps directly instead of probing every page.
+    //
+    // Phase H short-circuit: see `_buildPageOverlayWidgets` for the
+    // same trick — single-page mode pins the range to one entry.
+    final ({int begin, int end}) visibleRange;
+    if (widget.params.singlePageMode) {
+      final int n = (_pageNumber ?? _gotoTargetPageNumber ?? widget.initialPageNumber)
+          .clamp(1, _document!.pages.length);
+      visibleRange = (begin: n - 1, end: n);
+    } else {
+      visibleRange = _layout!.visiblePageRange(cacheTargetRect);
+    }
+
+    void handleOffScreenPage(int pageNumber) {
+      final hadTokens = cache.cancellationTokens[pageNumber]?.isNotEmpty ?? false;
+      cache.cancelPendingRenderings(pageNumber);
+      if (cache.pageImages.containsKey(pageNumber)) {
+        unusedPageList.add(pageNumber);
+      }
+      if (hadTokens) {
+        debugPrint('[ARGUS-DBG] handleOffScreenPage cancelled tokens for page=$pageNumber (visible range was $visibleRange)');
+      }
+    }
+
+    // ARGUS fork — Phase K1 (2026-05-14). The F2 neighbour-prefetch
+    // hook fires `_cachePagePreviewImage` for pages N±1 / N±2 from
+    // inside `_setCurrentPageNumber`, which registers a cancellation
+    // token in `cancellationTokens` BEFORE the render's synchronized
+    // block runs. The very next paint frame's off-screen walk used to
+    // see those tokens as "outside the visible range" and cancel them
+    // immediately — defeating F2 entirely (the prefetched pages
+    // bailed out of the render at the cancellation check inside the
+    // synchronized block, so only the current page ever rendered).
+    //
+    // The fix: skip BOTH the cancellation pass AND the unused-list
+    // pass for pages within a small radius of the current page in
+    // single-page mode. Those are exactly the pages F2 is intentionally
+    // warming — cancelling their pending renders OR marking their
+    // already-cached entries for byte-budget eviction is
+    // counter-productive. Genuine off-screen pages (beyond ±2) still
+    // get cancelled and eviction-eligible, keeping memory bounded.
+    final int prefetchPreserveRadius = widget.params.singlePageMode ? 2 : 0;
+    final int currentPageNumberForPreserve =
+        _pageNumber ?? _gotoTargetPageNumber ?? widget.initialPageNumber;
+    bool _isInPrefetchZone(int pageNumber) =>
+        prefetchPreserveRadius > 0 &&
+        (pageNumber - currentPageNumberForPreserve).abs() <= prefetchPreserveRadius;
+
+    // Snapshot keys before mutating: `cancelPendingRenderings` /
+    // `add` may modify the underlying maps.
+    final cachedKeysSnapshot = cache.pageImages.keys.toList(growable: false);
+    for (final pageNumber in cachedKeysSnapshot) {
+      final i = pageNumber - 1;
+      if (i < visibleRange.begin || i >= visibleRange.end) {
+        if (_isInPrefetchZone(pageNumber)) continue;
+        handleOffScreenPage(pageNumber);
+      }
+    }
+    final pendingKeysSnapshot = cache.cancellationTokens.keys.toList(growable: false);
+    for (final pageNumber in pendingKeysSnapshot) {
+      final i = pageNumber - 1;
+      if (i < visibleRange.begin || i >= visibleRange.end) {
+        if (_isInPrefetchZone(pageNumber)) continue;
+        // Skip log if list is already empty (recurring no-op when the
+        // map keeps the empty key around forever).
+        if ((cache.cancellationTokens[pageNumber]?.isEmpty ?? true)) continue;
+        debugPrint('[ARGUS-DBG] cancelling pending render page=$pageNumber (visible range $visibleRange)');
+        cache.cancelPendingRenderings(pageNumber);
+      }
+    }
+
+    for (var i = visibleRange.begin; i < visibleRange.end; i++) {
       final rect = _layout!.pageLayouts[i];
       final intersection = rect.intersect(cacheTargetRect);
       if (intersection.isEmpty) {
-        final page = _document!.pages[i];
-        cache.cancelPendingRenderings(page.pageNumber);
-        if (cache.pageImages.containsKey(i + 1)) {
-          unusedPageList.add(i + 1);
-        }
+        // Range-superset edge case: a page in the binary-search range
+        // doesn't actually overlap the viewport (e.g. extreme x
+        // offset on a custom layout). Treat as off-screen.
+        //
+        // ARGUS fork — Phase N (2026-05-13). EXCEPT in singlePageMode,
+        // where every nav goes through a brief matrix-transition window
+        // (`_goTo` with Duration.zero still routes through the
+        // AnimationController's listener, so `_visibleRect` is stale
+        // for the first paint frame after `_setCurrentPageNumber`).
+        // During that window the just-navigated-to target page can be
+        // misclassified as "off-screen", which used to cancel its
+        // freshly-registered render token AND mark it for byte-budget
+        // eviction. The K1 prefetch zone (±2 in single-page mode) was
+        // already protecting the snapshot loops above; extend the same
+        // protection to the inline path so the current page (and its
+        // immediate prefetch neighbours) cannot be cancelled by a
+        // transient intersect miss.
+        if (_isInPrefetchZone(i + 1)) continue;
+        handleOffScreenPage(i + 1);
         continue;
       }
 
@@ -1313,7 +1800,16 @@ class _PdfViewerState extends State<PdfViewer>
         widget.params.onePassRenderingScaleThreshold,
       );
 
-      if (dropShadowPaint != null) {
+      // ARGUS fork — Phase N7 (2026-05-13). The drop shadow used to draw
+      // unconditionally, so a freshly-scrolled-to page that hadn't yet
+      // rendered showed up as a hollow shadow-rect outline on the dark
+      // editor background — visible "frame around nothing" effect the
+      // user explicitly rejected ("transparan kalsın işte orta bölge").
+      // Gate the shadow on the preview image existing: once there's
+      // pixel content to surround, draw the shadow; until then the
+      // entire page footprint stays transparent and the viewer's
+      // backgroundColor shows through cleanly.
+      if (dropShadowPaint != null && previewImage != null) {
         final offset = widget.params.pageDropShadow!.offset;
         final spread = widget.params.pageDropShadow!.spreadRadius;
         final shadowRect = rect.translate(offset.dx, offset.dy).inflateHV(horizontal: spread, vertical: spread);
@@ -1333,14 +1829,19 @@ class _PdfViewerState extends State<PdfViewer>
           rect,
           Paint()..filterQuality = filterQuality,
         );
-      } else {
-        canvas.drawRect(
-          rect,
-          Paint()
-            ..color = Colors.white
-            ..style = PaintingStyle.fill,
-        );
       }
+      // ARGUS fork — Phase N6 (2026-05-13). The upstream `else` branch
+      // here filled the page rect with `Colors.white` as a fallback so
+      // the user could see "where the page will be" before its render
+      // landed. On dark themes (argus editor uses a `0xFF26282E`
+      // slate backgroundColor) this manifested as a ~500 ms white
+      // flash whenever a page first scrolled into view — visually
+      // jarring and conveys nothing meaningful (a featureless white
+      // rectangle is no more informative than the bare background).
+      // Dropping the fill makes the unrendered region transparent;
+      // the viewer's `params.backgroundColor` shows through naturally
+      // until the preview image arrives. The drop-shadow above (line
+      // 1670) still draws so the page boundary is visually inferable.
 
       if (enableLowResolutionPagePreview &&
           (previewImage == null || previewImage.isDirty || previewImage.scale != previewScaleLimit)) {
@@ -1391,13 +1892,61 @@ class _PdfViewerState extends State<PdfViewer>
             unusedPageList,
             maxImageCacheBytes,
             currentPage,
-            dist: (pageNumber) =>
-                (_layout!.pageLayouts[pageNumber - 1].center - _layout!.pageLayouts[currentPage.pageNumber - 1].center)
-                    .distanceSquared,
+            dist: _evictionDistanceFor(currentPage),
           );
         }
       }
     }
+
+    // ARGUS fork addition (2026-05-13): proactive hard page-count cap.
+    //
+    // The byte-budget eviction inside the loop above only fires when a
+    // page actually leaves the cache-extent rect AND the byte total has
+    // already overshot. On low-RAM smart-board hardware a fast
+    // scroll-thumb drag can enqueue many pages before either condition is
+    // tripped, causing the RAM spike documented in pdfrx issue #604
+    // (300 MB → 1.7 GB on 500+ page PDFs). When
+    // [PdfViewerParams.maxCachedPageCount] is set, we evict the farthest
+    // cached pages (by document-coordinate distance from the current
+    // page) at the end of every paint frame until the cache holds no
+    // more than that many entries — a hard ceiling that's independent of
+    // per-page render size.
+    final maxPageCount = widget.params.maxCachedPageCount;
+    if (maxPageCount != null && maxPageCount >= 1) {
+      final currentPageNumber = _pageNumber;
+      if (currentPageNumber != null && currentPageNumber > 0) {
+        final currentPage = _document!.pages[currentPageNumber - 1];
+        cache.removeCacheImagesIfPageCountExceedsLimit(
+          maxPageCount,
+          currentPage,
+          dist: _evictionDistanceFor(currentPage),
+        );
+      }
+    }
+  }
+
+  /// ARGUS fork — Phase H7 (2026-05-14). Eviction distance function
+  /// shared between the byte-budget and page-count cap eviction paths.
+  ///
+  /// **Multi-page mode**: geometric distance between page-rect centres —
+  /// preserves the original pdfrx behaviour where pages that are
+  /// far away in document space evict first.
+  ///
+  /// **Single-page mode**: page-number distance instead, because the
+  /// `Rect.zero` rects for non-current pages would make the geometric
+  /// metric report identical distance for everything. Keeping the
+  /// immediate neighbours (`N±1`, `N±2` warmed by the F2 prefetch)
+  /// alive is what we want — they're the destinations the user is most
+  /// likely to navigate to next.
+  double Function(int pageNumber) _evictionDistanceFor(PdfPage currentPage) {
+    if (widget.params.singlePageMode) {
+      final currentNumber = currentPage.pageNumber;
+      return (pageNumber) => (pageNumber - currentNumber).abs().toDouble();
+    }
+    return (pageNumber) =>
+        (_layout!.pageLayouts[pageNumber - 1].center -
+                _layout!.pageLayouts[currentPage.pageNumber - 1].center)
+            .distanceSquared;
   }
 
   /// Loads text for the specified page number.
@@ -1436,20 +1985,21 @@ class _PdfViewerState extends State<PdfViewer>
   bool _hitTestForTextSelection(ui.Offset position) {
     if (_selPartMoving != _TextSelectionPart.free && enableSelectionHandles) return false;
     if (_document == null || _layout == null) return false;
-    for (var i = 0; i < _document!.pages.length; i++) {
-      final pageRect = _layout!.pageLayouts[i];
-      if (!pageRect.contains(position)) continue;
-      final page = _document!.pages[i];
-      final text = _getCachedTextOrDelayLoadText(
-        page.pageNumber,
-        invalidate: false,
-      ); // the routine may be called multiple times, we can ignore the chance
-      if (text == null) continue;
-      for (final f in text.fragments) {
-        final rect = f.bounds.toRectInDocument(page: page, pageRect: pageRect).inflate(_hitTestMargin);
-        if (rect.contains(position)) {
-          return true;
-        }
+    // ARGUS fork — Phase F1 (2026-05-14). O(N) page scan → O(log N)
+    // binary search via [PdfPageLayout.pageIndexContaining].
+    final i = _layout!.pageIndexContaining(position);
+    if (i < 0) return false;
+    final pageRect = _layout!.pageLayouts[i];
+    final page = _document!.pages[i];
+    final text = _getCachedTextOrDelayLoadText(
+      page.pageNumber,
+      invalidate: false,
+    ); // the routine may be called multiple times, we can ignore the chance
+    if (text == null) return false;
+    for (final f in text.fragments) {
+      final rect = f.bounds.toRectInDocument(page: page, pageRect: pageRect).inflate(_hitTestMargin);
+      if (rect.contains(position)) {
+        return true;
       }
     }
     return false;
@@ -1470,7 +2020,37 @@ class _PdfViewerState extends State<PdfViewer>
     return PdfPageLayout(pageLayouts: pageLayout, documentSize: Size(width, y));
   }
 
-  void _invalidate() => _updateStream.add(_txController.value);
+  /// Re-emit the current matrix on [_updateStream] so the `StreamBuilder`
+  /// in [build] rebuilds. Coalesced via a post-frame callback so that a
+  /// burst of invalidations within one frame produces a single rebuild.
+  ///
+  /// ARGUS fork addition (2026-05-13). The original implementation called
+  /// `_updateStream.add(_txController.value)` synchronously on every
+  /// invocation. For a 1000-page PDF, [PdfDocument.loadPagesProgressively]
+  /// emits hundreds of `PdfDocumentPageStatusChangedEvent`s during the
+  /// initial scan; each one calls [_invalidate] (see [_onDocumentEvent]
+  /// FIXME). That used to mean hundreds of `StreamBuilder` rebuilds — each
+  /// re-running [_relayoutPages] (O(N)) and [_paintPagesCustom] (O(N))
+  /// during cold open. With this coalescer all invalidations that arrive
+  /// before the next frame draws collapse into one rebuild, which alone
+  /// removed multi-second cold-open jank on 500+ page docs.
+  ///
+  /// We pair `addPostFrameCallback` with `scheduleFrame` so that the
+  /// callback still fires when the app is otherwise idle (e.g. document
+  /// events arriving between user interactions).
+  void _invalidate() {
+    if (_invalidateScheduled || !mounted) return;
+    _invalidateScheduled = true;
+    final binding = WidgetsBinding.instance;
+    binding.scheduleFrame();
+    binding.addPostFrameCallback((_) {
+      _invalidateScheduled = false;
+      if (!mounted) return;
+      _updateStream.add(_txController.value);
+    });
+  }
+
+  bool _invalidateScheduled = false;
 
   Future<void> _requestPagePreviewImageCached(_PdfPageImageCache cache, PdfPage page, double scale) async {
     final width = page.width * scale;
@@ -1500,14 +2080,117 @@ class _PdfViewerState extends State<PdfViewer>
   ) async {
     if (!mounted) return;
     final prev = cache.pageImages[page.pageNumber];
-    if (prev != null && !prev.isDirty && prev.scale == scale) return;
-    final cancellationToken = page.createCancellationToken();
+    if (prev != null && !prev.isDirty && prev.scale == scale) {
+      return;
+    }
 
+    // ARGUS fork — Phase Y2 (2026-05-14, revised same day to use the
+    // sparse loader). When `_loadDelayed` no longer pre-loads every
+    // page in the document, a navigation jump (e.g. page 1 → 100)
+    // may arrive at this render path BEFORE the page's PDFium
+    // metadata has been resolved. `page.render` returns null when
+    // `!page.isLoaded` (see pdfrx_pdfium.dart:~1295), which the
+    // paint loop then draws as a transparent / white fallback rect.
+    // Block on the SPARSE loader (`_ensurePageLoadedSparse`) so the
+    // worker populates THIS page (+ ±2 neighbours) — not every
+    // intermediate page between the last contiguous marker and the
+    // target. The contiguous variant added ~300 MB of RSS on a
+    // 270-page textbook when the user jumped from page 1 to the
+    // last page; the sparse variant touches at most 5 pages.
+    if (!page.isLoaded) {
+      await _ensurePageLoadedSparse(page.pageNumber);
+      if (!mounted) return;
+      // `_loadPagesInLimitedTime` rebuilds the document's `pages` list
+      // with fresh PdfPage instances each batch, so the `page` we were
+      // handed may now be a stale placeholder pointing at the old
+      // `isLoaded: false` snapshot. Re-resolve from the document so the
+      // render call below gets the live handle.
+      final List<PdfPage> docPages = _document?.pages ?? const <PdfPage>[];
+      if (page.pageNumber - 1 < docPages.length) {
+        page = docPages[page.pageNumber - 1];
+      }
+      if (!page.isLoaded) {
+        // Still not loaded (load was aborted, document swapped, etc.).
+        // Drop the request quietly; the next paint frame will retry.
+        return;
+      }
+    }
+
+    // ARGUS fork — Phase M3+M5 REVERTED (2026-05-13). Going back to
+    // upstream's `cache.synchronized` wrap.
+    //
+    // Why we reverted:
+    // - M3 had removed the lock to fix a "page 2's synchronized
+    //   callback never fires" bug, but with the lock gone the
+    //   render path triggered an unbounded paint-loop render storm
+    //   (60 fps × seconds = hundreds of duplicate render queue jobs
+    //   per page).
+    // - M5 added an explicit `pagesBeingRendered` Set as a paint-loop
+    //   dedupe. After M5 the user reported even page 1 stopped
+    //   rendering — symptoms got strictly worse, not better.
+    //
+    // The upstream lock provides dedupe naturally: callers that wait
+    // on the lock re-check `cache.pageImages[N]` after acquiring it,
+    // so a single synchronized callback renders, populates the cache,
+    // and subsequent waiters bail via `BAIL_HAVE_PREV`. The "page 2
+    // stuck on synchronized" symptom we attributed to the lock will
+    // be re-investigated with a different hypothesis next pass
+    // (likely F2 prefetch interaction or BackgroundWorker queue).
+    //
+    // M2 [ARGUS-DBG] debug prints kept — still load-bearing for the
+    // next round of diagnosis.
+    //
+    // Disk cache lookup (E4 + L1) preserved structurally — `renderCache`
+    // is null in argus apps (M1 disabled) so the block is dead code
+    // there, but kept so a future re-enable doesn't need to re-derive
+    // the disk-first-then-PDFium ordering.
+    final renderCache = widget.params.renderCache;
+    final doc = _document;
+    if (renderCache != null && doc != null && prev == null) {
+      try {
+        final cachedPng = await renderCache
+            .tryGet(
+              document: doc,
+              page: page,
+              scale: scale,
+            )
+            .timeout(const Duration(milliseconds: 500), onTimeout: () => null);
+        if (cachedPng != null && mounted) {
+          try {
+            final codec = await ui.instantiateImageCodec(cachedPng);
+            final frame = await codec.getNextFrame();
+            codec.dispose();
+            if (mounted && cache.pageImages[page.pageNumber] == null) {
+              cache.pageImages[page.pageNumber] = _PdfImageWithScale(frame.image, scale);
+              _invalidate();
+              return;
+            }
+            frame.image.dispose();
+          } catch (_) {
+            // PNG decode or instantiate failed — fall through to PDFium.
+          }
+        }
+      } catch (_) {
+        // Disk cache lookup itself failed — fall through silently.
+      }
+    }
+
+    final cancellationToken = page.createCancellationToken();
     cache.addCancellationToken(page.pageNumber, cancellationToken);
+    debugPrint('[ARGUS-DBG] _cachePagePreviewImage ENTER page=${page.pageNumber} scale=$scale w=$width h=$height isLoaded=${page.isLoaded}');
     await cache.synchronized(() async {
-      if (!mounted || cancellationToken.isCanceled) return;
-      final prev = cache.pageImages[page.pageNumber];
-      if (prev != null && !prev.isDirty && prev.scale == scale) return;
+      if (!mounted || cancellationToken.isCanceled) {
+        debugPrint('[ARGUS-DBG] _cachePagePreviewImage BAIL_PRE_RENDER page=${page.pageNumber}');
+        return;
+      }
+      // Re-check inside the lock — a prior synchronized callback may
+      // have rendered this page while we waited.
+      final prevInLock = cache.pageImages[page.pageNumber];
+      if (prevInLock != null && !prevInLock.isDirty && prevInLock.scale == scale) {
+        debugPrint('[ARGUS-DBG] _cachePagePreviewImage BAIL_HAVE_PREV page=${page.pageNumber}');
+        return;
+      }
+      debugPrint('[ARGUS-DBG] _cachePagePreviewImage rendering page=${page.pageNumber}');
       PdfImage? img;
       try {
         img = await page.render(
@@ -1518,18 +2201,69 @@ class _PdfViewerState extends State<PdfViewer>
           flags: widget.params.limitRenderingCache ? PdfPageRenderFlags.limitedImageCache : PdfPageRenderFlags.none,
           cancellationToken: cancellationToken,
         );
+        debugPrint('[ARGUS-DBG] _cachePagePreviewImage page.render returned page=${page.pageNumber} img=${img != null ? "ok(${img.width}x${img.height})" : "null"} cancelled=${cancellationToken.isCanceled}');
         if (img == null || !mounted || cancellationToken.isCanceled) return;
 
-        final newImage = _PdfImageWithScale(await img.createImage(), scale);
-        cache.pageImages[page.pageNumber]?.dispose();
-        cache.pageImages[page.pageNumber] = newImage;
+        final renderedImage = await img.createImage();
+        final existing = cache.pageImages[page.pageNumber];
+        if (existing != null && !existing.isDirty && existing.scale == scale) {
+          renderedImage.dispose();
+          debugPrint('[ARGUS-DBG] _cachePagePreviewImage RACED page=${page.pageNumber}');
+          return;
+        }
+        existing?.dispose();
+        cache.pageImages[page.pageNumber] = _PdfImageWithScale(renderedImage, scale);
+        debugPrint('[ARGUS-DBG] _cachePagePreviewImage CACHED page=${page.pageNumber} image=${renderedImage.width}x${renderedImage.height}');
         _invalidate();
-      } catch (e) {
-        return; // ignore error
+
+        if (renderCache != null && doc != null) {
+          unawaited(
+            _persistRenderToDiskCache(renderCache, doc, page, scale, renderedImage),
+          );
+        }
+      } catch (e, st) {
+        debugPrint('[ARGUS-DBG] _cachePagePreviewImage CAUGHT page=${page.pageNumber} error=$e\n$st');
+        return;
       } finally {
         img?.dispose();
       }
     });
+    debugPrint('[ARGUS-DBG] _cachePagePreviewImage EXIT page=${page.pageNumber}');
+  }
+
+  /// ARGUS fork helper (2026-05-14, E4 + L1). PNG-encodes a freshly
+  /// rendered page bitmap and hands it to the host app's disk cache.
+  /// Failure is silent. PNG encode AND the cache write are both
+  /// capped at 5 s — on Windows we've seen `flutter_cache_manager`'s
+  /// underlying sqflite layer hang indefinitely if its DB hasn't been
+  /// set up, and an `unawaited` leak isn't a hang you can recover
+  /// from on shutdown (`stopBackgroundWorker` waits for stragglers).
+  /// 5 s is long enough that a real disk write on a slow USB stick
+  /// still succeeds, short enough that a wedged cache layer doesn't
+  /// strand the process.
+  Future<void> _persistRenderToDiskCache(
+    PdfPageRenderCache renderCache,
+    PdfDocument doc,
+    PdfPage page,
+    double scale,
+    ui.Image image,
+  ) async {
+    try {
+      final byteData = await image
+          .toByteData(format: ui.ImageByteFormat.png)
+          .timeout(const Duration(seconds: 5), onTimeout: () => null);
+      if (byteData == null) return;
+      await renderCache
+          .put(
+            document: doc,
+            page: page,
+            scale: scale,
+            pngBytes: byteData.buffer.asUint8List(),
+          )
+          .timeout(const Duration(seconds: 5));
+    } catch (_) {
+      // Disk cache writes are best-effort — never raise.
+    }
   }
 
   Future<void> _requestRealSizePartialImage(
@@ -1544,21 +2278,73 @@ class _PdfViewerState extends State<PdfViewer>
     if (prev != null && !prev.isDirty && prev.rect == rect && prev.scale == scale) return;
     if (rect.width < 1 || rect.height < 1) return;
 
-    cache.pageImagePartialRenderingRequests[page.pageNumber]?.cancel();
+    // ⚠⚠⚠ ARGUS fork (2026-08-20) — DO NOT RESTART AN IDENTICAL REQUEST.
+    //
+    // Field report: *"the first page opened, and the first shared-text
+    // question, are blurry; later pages are fine. I can see it sharpen a
+    // few ms later."*
+    //
+    // The sharp (real-size) pass is what removes that blur: until it
+    // lands, the low-resolution preview is drawn UPSCALED, because the
+    // displayed scale is `zoom * devicePixelRatio` while the preview is
+    // capped at `onePassRenderingScaleThreshold` (2.0 in ARGUS).
+    //
+    // Upstream cancelled the pending request unconditionally on the next
+    // line. `_paintPagesCustom` runs on EVERY repaint, and this viewer
+    // repaints often (ink ticks, provider updates, the fit-retry loop at
+    // open, focus animations). Each of those repaints killed the render
+    // that was already in flight FOR THE VERY SAME rect and scale and
+    // started it over — so the sharp pass was starved for as long as the
+    // repaint burst lasted. On a freshly opened document that burst is
+    // longest (fit retries + page-metadata sweep + status updates), which
+    // is exactly why the FIRST page was the blurry one.
+    //
+    // ⚠ Cancelling is still correct when the request CHANGED (the user
+    //   zoomed or panned) — that render's output is stale. The bug was
+    //   cancelling an identical one.
+    final pendingReq = cache.pageImagePartialRenderingRequests[page.pageNumber];
+    // ⚠ `!isCanceled` IS LOAD-BEARING: if a request were cancelled from
+    //   elsewhere and its bookkeeping entry stayed behind, this guard would
+    //   block every future request and the page would NEVER sharpen — a
+    //   worse failure than the bug being fixed. A cancelled entry is
+    //   treated as absent.
+    if (pendingReq != null &&
+        !pendingReq.cancellationToken.isCanceled &&
+        pendingReq.rect == rect &&
+        pendingReq.scale == scale) {
+      return; // already on its way for exactly this view — let it finish
+    }
+    pendingReq?.cancel();
 
     final cancellationToken = page.createCancellationToken();
-    cache.pageImagePartialRenderingRequests[page.pageNumber] = _PdfPartialImageRenderingRequest(
+    late final _PdfPartialImageRenderingRequest req;
+    req = _PdfPartialImageRenderingRequest(
       Timer(widget.params.behaviorControlParams.partialImageLoadingDelay, () async {
-        if (!mounted || cancellationToken.isCanceled) return;
+        if (!mounted || cancellationToken.isCanceled) {
+          if (identical(cache.pageImagePartialRenderingRequests[page.pageNumber], req)) {
+            cache.pageImagePartialRenderingRequests.remove(page.pageNumber);
+          }
+          return;
+        }
         final newImage = await _createRealSizePartialImage(cache, page, scale, rect, cancellationToken);
         if (newImage != null) {
           cache.pageImagesPartial.remove(page.pageNumber)?.dispose();
           cache.pageImagesPartial[page.pageNumber] = newImage;
           _invalidate();
         }
+        // ⚠ Drop the bookkeeping entry once finished, otherwise the guard
+        //   above would treat this completed request as "still pending"
+        //   and a later genuine re-request (dirty cache, new page) would
+        //   never be issued.
+        if (identical(cache.pageImagePartialRenderingRequests[page.pageNumber], req)) {
+          cache.pageImagePartialRenderingRequests.remove(page.pageNumber);
+        }
       }),
       cancellationToken,
+      rect,
+      scale,
     );
+    cache.pageImagePartialRenderingRequests[page.pageNumber] = req;
   }
 
   Future<_PdfImageWithScaleAndRect?> _createRealSizePartialImage(
@@ -1718,7 +2504,22 @@ class _PdfViewerState extends State<PdfViewer>
 
   Matrix4 _calcMatrixForPage({required int pageNumber, PdfPageAnchor? anchor}) {
     final boundaryMargin = _adjustedBoundaryMargins;
-    final pageRect = _layout!.pageLayouts[pageNumber - 1].inflate(widget.params.margin);
+    final Rect pageRect;
+    if (widget.params.singlePageMode) {
+      // ARGUS fork — Phase H5 (2026-05-14). In single-page mode the
+      // layout only ever non-zeros ONE page rect, so
+      // `_layout!.pageLayouts[pageNumber - 1]` may be `Rect.zero` if
+      // `pageNumber` differs from what's currently laid out (e.g.
+      // during a goToPage call that updates `_gotoTargetPageNumber`
+      // before relayout). Compute the target page's rect at the
+      // canonical single-page origin `(margin, margin)` directly from
+      // its dimensions.
+      final page = _document!.pages[pageNumber - 1];
+      final double m = widget.params.margin;
+      pageRect = Rect.fromLTWH(m, m, page.width, page.height).inflate(m);
+    } else {
+      pageRect = _layout!.pageLayouts[pageNumber - 1].inflate(widget.params.margin);
+    }
 
     // If boundaryMargin is infinite, don't inflate the rect
     final targetRect = boundaryMargin.inflateRectIfFinite(pageRect);
@@ -1888,6 +2689,20 @@ class _PdfViewerState extends State<PdfViewer>
     }
     _gotoTargetPageNumber = pageNumber;
 
+    if (widget.params.singlePageMode) {
+      // ARGUS fork — Phase H6 (2026-05-14).
+      debugPrint('[ARGUS-DBG] _goToPage SINGLE_PAGE: target=$targetPageNumber, prev=_pageNumber=$_pageNumber');
+      _setCurrentPageNumber(targetPageNumber, doSetState: true);
+      _relayoutPages();
+      _calcCoverFitScale();
+      final synthMatrix = _calcMatrixForPage(pageNumber: targetPageNumber, anchor: anchor);
+      final clampedMatrix = _calcMatrixForClampedToNearestBoundary(synthMatrix, viewSize: _viewSize!);
+      debugPrint('[ARGUS-DBG] _goToPage matrix synth=$synthMatrix clamp=$clampedMatrix viewSize=$_viewSize docSize=${_layout?.documentSize}');
+      await _goTo(clampedMatrix, duration: Duration.zero);
+      debugPrint('[ARGUS-DBG] _goToPage _goTo returned. _pageNumber=$_pageNumber matrix=${_txController.value}');
+      return;
+    }
+
     await _goTo(
       _calcMatrixForClampedToNearestBoundary(
         _calcMatrixForPage(pageNumber: targetPageNumber, anchor: anchor),
@@ -1957,6 +2772,35 @@ class _PdfViewerState extends State<PdfViewer>
       final r = Matrix4.inverted(_txController.value);
       offset = r.transformOffset(offset);
     }
+
+    // ARGUS fork — Phase Q1 (2026-05-13). In singlePageMode every
+    // entry of `pageLayouts` shares the canonical `(margin, margin)`
+    // origin (`_singlePageLayoutPages` deliberately stacks them so
+    // host code that reads `pageLayouts[N-1]` for any N gets a
+    // sensible per-page rect). The naïve "iterate, first match wins"
+    // walk below would always return PAGE 1 — every page rect
+    // contains the same in-page hit point, and the loop short-circuits
+    // at i=0. That made `drawing_overlay._resolvePage` commit pen
+    // strokes to page 1 no matter which page the user was on; the
+    // painter then read `state.pages[currentPage]` (≠ 1) and found
+    // nothing to draw, so the stroke seemed to "disappear on mouse
+    // release". Same shape as the editor's Phase N4 bug, but in the
+    // shared pdfrx hit-test API used by both viewer drawing and
+    // editor interaction. Short-circuit: only the visible page can be
+    // hit in single-page presentation, so consult that one and skip
+    // the loop entirely.
+    if (widget.params.singlePageMode) {
+      final int? n = _pageNumber ?? _gotoTargetPageNumber ?? widget.initialPageNumber;
+      if (n == null || n < 1 || n > pages.length) return null;
+      final page = pages[n - 1];
+      final pageRect = pageLayouts[n - 1];
+      if (!pageRect.contains(offset)) return null;
+      return PdfPageHitTestResult(
+        page: page,
+        offset: offset.translate(-pageRect.left, -pageRect.top).toPdfPoint(page: page, scaledPageSize: pageRect.size),
+      );
+    }
+
     for (var i = 0; i < pages.length; i++) {
       final page = pages[i];
       final pageRect = pageLayouts[i];
@@ -3194,24 +4038,23 @@ class _PdfViewerState extends State<PdfViewer>
 
   @override
   Future<void> selectWord(Offset offset, {PointerDeviceKind? deviceKind}) async {
-    for (var i = 0; i < _document!.pages.length; i++) {
+    // ARGUS fork — Phase F1 (2026-05-14). Was a linear scan over
+    // every page; now a single binary search via
+    // [PdfPageLayout.pageIndexContaining]. The post-body cleanup (the
+    // `_selPartMoving` reset etc.) runs unconditionally as before.
+    final i = _layout!.pageIndexContaining(offset);
+    findWord:
+    {
+      if (i < 0) break findWord;
       final pageRect = _layout!.pageLayouts[i];
-      if (!pageRect.contains(offset)) {
-        continue;
-      }
-
       final text = await _loadTextAsync(i + 1);
-      if (text == null || text.fullText.isEmpty) {
-        continue;
-      }
+      if (text == null || text.fullText.isEmpty) break findWord;
       final page = _document!.pages[i];
       final point = offset
           .translate(-pageRect.left, -pageRect.top)
           .toPdfPoint(page: page, scaledPageSize: pageRect.size);
       final f = text.fragments.firstWhereOrNull((f) => f.bounds.containsPoint(point));
-      if (f == null) {
-        continue;
-      }
+      if (f == null) break findWord;
       final range = PdfPageTextRange(pageText: text, start: f.index, end: f.end);
       final selectionRect = f.bounds.toRectInDocument(page: page, pageRect: pageRect);
       _selA = PdfTextSelectionPoint(text, f.index);
@@ -3225,7 +4068,6 @@ class _PdfViewerState extends State<PdfViewer>
       );
       _textSelB = _textSelA!.copyWith(type: PdfTextSelectionAnchorType.b, index: _selB!.index);
       _textSelectAnchor = Offset(_txController.value.x, _txController.value.y);
-      break;
     }
 
     _selPartMoving = _TextSelectionPart.none;
@@ -3410,12 +4252,73 @@ class _PdfPageImageCache {
       }
     }
   }
+
+  /// Hard cap on the number of distinct page entries kept in the in-memory
+  /// image cache. Counts the *union* of [pageImages] and [pageImagesPartial]
+  /// keys (a page with both a preview and a partial image counts once).
+  ///
+  /// ARGUS fork addition (2026-05-13). The original
+  /// [removeCacheImagesIfCacheBytesExceedsLimit] is reactive (it only evicts
+  /// pages that have already left the cache-extent rectangle, and only when
+  /// the byte budget is exceeded). On low-RAM smart-board hardware viewing
+  /// 300-1000 page PDFs, a fast scroll-thumb drag can enqueue hundreds of
+  /// renders before the byte-budget eviction fires — see pdfrx issue #604.
+  /// This method runs at the end of every paint frame and proactively
+  /// evicts the farthest cached pages (by document-coordinate distance from
+  /// [currentPage]) until the cache count is no greater than [maxPageCount].
+  ///
+  /// No-op if the cache is already at or below the cap. Disposes the
+  /// underlying `ui.Image` GPU textures for evicted entries so PDFium's
+  /// pixel buffers + the GL/Vulkan texture both get released.
+  void removeCacheImagesIfPageCountExceedsLimit(
+    int maxPageCount,
+    PdfPage currentPage, {
+    required double Function(int pageNumber) dist,
+  }) {
+    // Union of both image maps' keys — a page with both preview + partial
+    // counts as one entry, matching how we'd report cache size to a human.
+    final allKeys = <int>{...pageImages.keys, ...pageImagesPartial.keys}.toList();
+    if (allKeys.length <= maxPageCount) return;
+
+    // Farthest pages first. Stable for ties (distance == 0 only for current).
+    allKeys.sort((a, b) => dist(b).compareTo(dist(a)));
+
+    var remaining = allKeys.length;
+    for (final key in allKeys) {
+      if (remaining <= maxPageCount) break;
+      // Never evict the current page itself even if maxPageCount somehow
+      // ends up < 1 (defensive — caller is expected to pass >= 1).
+      if (key == currentPage.pageNumber) continue;
+      // ARGUS fork — Phase X1 (2026-05-14). Drop any in-flight render
+      // cancellation tokens *and* their debounced kick-off timer for
+      // the evicted page. Upstream only freed `pageImages` /
+      // `pageImagesPartial`; the `cancellationTokens` and
+      // `pageImageRenderingTimers` maps kept entries indefinitely. On
+      // a 270-page document that's a slow but real heap leak that
+      // also lets cancelled renders continue to occupy
+      // BackgroundWorker slots if they were already in flight.
+      cancelPendingRenderings(key);
+      pageImageRenderingTimers.remove(key)?.cancel();
+      final removed = pageImages.remove(key);
+      if (removed != null) removed.image.dispose();
+      pageImagesPartial.remove(key)?.dispose();
+      remaining--;
+    }
+  }
 }
 
 class _PdfPartialImageRenderingRequest {
-  _PdfPartialImageRenderingRequest(this.timer, this.cancellationToken);
+  _PdfPartialImageRenderingRequest(this.timer, this.cancellationToken, this.rect, this.scale);
   final Timer timer;
   final PdfPageRenderCancellationToken cancellationToken;
+
+  /// ARGUS fork (2026-08-20). Which (rect, scale) this in-flight request is
+  /// for. Upstream did not track this, so `_requestRealSizePartialImage`
+  /// cancelled the pending render on EVERY repaint — even when the new
+  /// request was byte-for-byte identical. See that method for the field
+  /// report this closes.
+  final Rect rect;
+  final double scale;
 
   void cancel() {
     timer.cancel();
@@ -3639,9 +4542,103 @@ enum PdfTextSelectionAnchorType { a, b }
 
 /// Defines page layout.
 class PdfPageLayout {
-  PdfPageLayout({required this.pageLayouts, required this.documentSize});
+  PdfPageLayout({required this.pageLayouts, required this.documentSize})
+      : _isVerticallyMonotone = _detectVerticallyMonotone(pageLayouts);
   final List<Rect> pageLayouts;
   final Size documentSize;
+
+  /// ARGUS fork addition (F1, 2026-05-14). Pre-computed at
+  /// construction so the binary-search visible-range helpers below can
+  /// short-circuit to a linear scan for arbitrary custom layouts
+  /// without re-checking per call.
+  final bool _isVerticallyMonotone;
+
+  static bool _detectVerticallyMonotone(List<Rect> pages) {
+    for (var i = 1; i < pages.length; i++) {
+      if (pages[i].top < pages[i - 1].top) return false;
+    }
+    return true;
+  }
+
+  /// Returns the half-open page-index range `[begin, end)` whose
+  /// layout rects might overlap [viewport]. O(log N) when pages are
+  /// vertically monotone (the default pdfrx layout AND argus's
+  /// `_singlePageLayout`); O(N) linear fallback for custom non-monotone
+  /// layouts.
+  ///
+  /// ARGUS fork addition (F1, 2026-05-14). The viewer's hot loops
+  /// (`_paintPagesCustom`, `_buildPageOverlayWidgets`, hit tests) used
+  /// to iterate every page in the document on every frame just to
+  /// discover which ones overlap the viewport — for a 1000-page PDF
+  /// at 60 fps that's 60 000 rect intersects per second of pan/zoom,
+  /// the bulk of them returning empty. With this range computed once
+  /// per paint, those loops drop to ~3-5 iterations on typical zoom.
+  ///
+  /// The returned range is a **superset** of truly visible pages —
+  /// callers should still apply a per-page rect.intersect check to
+  /// weed out partial overlaps, but anything OUTSIDE the range is
+  /// guaranteed not to overlap.
+  ({int begin, int end}) visiblePageRange(Rect viewport) {
+    final pages = pageLayouts;
+    if (pages.isEmpty) return (begin: 0, end: 0);
+    if (!_isVerticallyMonotone) {
+      return (begin: 0, end: pages.length);
+    }
+    final yTop = viewport.top;
+    final yBottom = viewport.bottom;
+    // First page index where rect.bottom > yTop (the first page that
+    // could possibly overlap the viewport from the top).
+    int lo = 0, hi = pages.length;
+    while (lo < hi) {
+      final mid = (lo + hi) >> 1;
+      if (pages[mid].bottom <= yTop) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    final begin = lo;
+    // First page index where rect.top >= yBottom (the first page
+    // entirely below the viewport).
+    hi = pages.length;
+    while (lo < hi) {
+      final mid = (lo + hi) >> 1;
+      if (pages[mid].top < yBottom) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    return (begin: begin, end: lo);
+  }
+
+  /// Returns the index of the page whose layout rect contains
+  /// [point], or -1 if no page contains it. O(log N) for vertically
+  /// monotone layouts; O(N) fallback otherwise. ARGUS fork addition
+  /// (F1, 2026-05-14).
+  int pageIndexContaining(Offset point) {
+    final pages = pageLayouts;
+    if (pages.isEmpty) return -1;
+    if (!_isVerticallyMonotone) {
+      for (var i = 0; i < pages.length; i++) {
+        if (pages[i].contains(point)) return i;
+      }
+      return -1;
+    }
+    // Binary search by y, then verify x containment.
+    int lo = 0, hi = pages.length;
+    while (lo < hi) {
+      final mid = (lo + hi) >> 1;
+      if (pages[mid].bottom <= point.dy) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    if (lo >= pages.length) return -1;
+    if (pages[lo].contains(point)) return lo;
+    return -1;
+  }
 
   @override
   bool operator ==(Object other) {
