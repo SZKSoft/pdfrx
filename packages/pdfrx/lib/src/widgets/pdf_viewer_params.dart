@@ -55,11 +55,15 @@ class PdfViewerParams {
     this.enableKeyboardNavigation = true,
     this.scrollByArrowKey = 25.0,
     this.maxImageBytesCachedOnMemory = 100 * 1024 * 1024,
+    this.maxCachedPageCount,
+    this.renderCache,
+    this.singlePageMode = false,
     this.horizontalCacheExtent = 1.0,
     this.verticalCacheExtent = 1.0,
     this.linkHandlerParams,
     this.viewerOverlayBuilder,
     this.pageOverlaysBuilder,
+    this.loadingPlaceholderBuilder,
     this.loadingBannerBuilder,
     this.errorBannerBuilder,
     this.linkWidgetBuilder,
@@ -372,6 +376,90 @@ class PdfViewerParams {
   /// The internal cache mechanism tries to limit the actual memory usage under the value but it is not guaranteed.
   final int maxImageBytesCachedOnMemory;
 
+  /// Hard upper bound on how many distinct PDF page entries can live in the
+  /// in-memory image cache. `null` (default) disables the count cap; only the
+  /// byte budget [maxImageBytesCachedOnMemory] is enforced — pdfrx's original
+  /// behaviour.
+  ///
+  /// **ARGUS fork addition (2026-05-13)**. For 300-1000 page documents on
+  /// low-RAM smart-board hardware the byte budget alone is not enough: fast
+  /// scrolling enqueues page renders faster than the byte-budget eviction
+  /// can react, so the cache transiently holds many ui.Image GPU textures.
+  /// Setting [maxCachedPageCount] to a small number (e.g. 5) guarantees that
+  /// no matter the per-page render size or scroll speed the cache holds at
+  /// most that many pages — the farthest pages (by document-coordinate
+  /// distance from the current page) are proactively evicted at the end of
+  /// every paint frame.
+  ///
+  /// Counted entries are the *union* of [_PdfPageImageCache.pageImages] and
+  /// [_PdfPageImageCache.pageImagesPartial] keys, so a single page that has
+  /// both a preview image and a real-size partial image counts once.
+  ///
+  /// Sensible values:
+  /// - `null` — disabled, pre-fork behaviour.
+  /// - `3` — current + previous + next page only (single-page viewer profile).
+  /// - `5-8` — small prefetch radius, suits scroll-through reading.
+  /// - `20+` — large prefetch, more like the original behaviour but with a
+  ///   safety net.
+  final int? maxCachedPageCount;
+
+  /// Disk-backed cross-session cache for full-page render PNGs.
+  ///
+  /// **ARGUS fork addition (2026-05-14)**. The in-memory tile cache
+  /// ([maxImageBytesCachedOnMemory] + [maxCachedPageCount]) bounds RAM
+  /// at the cost of evicting pages the user might revisit — which on
+  /// smart-board hardware means a 200-500 ms fresh PDFium render every
+  /// time. With [renderCache] set, pdfrx checks the host-app-supplied
+  /// disk cache before kicking off a PDFium render, and writes the
+  /// freshly-rendered preview back to it. A PNG decode from a warm
+  /// disk cache is ~50 ms — fast enough that the blank-page fallback
+  /// rect is hardly seen.
+  ///
+  /// The cache only intercepts the **low-res preview pass**
+  /// ([_cachePagePreviewImage]), not the real-size partial pass. The
+  /// partials are viewport-clipped at the current zoom and there's no
+  /// stable cache key shape for them.
+  ///
+  /// `null` (default) disables disk caching — preview renders always
+  /// go straight to PDFium. See [PdfPageRenderCache] for the contract.
+  final PdfPageRenderCache? renderCache;
+
+  /// Native single-page presentation mode (no document scroll).
+  ///
+  /// **ARGUS fork addition (2026-05-14, Phase H).** When `true` the
+  /// viewer lays out **only the current page** — `documentSize`
+  /// equals one page plus margins, the matrix can't scroll between
+  /// pages, and navigation happens exclusively via
+  /// [PdfViewerController.goToPage] / `nextPage` / `previousPage`.
+  /// The user can still pinch-zoom and pan WITHIN the current page.
+  ///
+  /// This replaces a common host-app workaround where the layout
+  /// function returned a multi-page rect list separated by a giant
+  /// (20 000 pt+) gap so adjacent pages could "never enter the
+  /// viewport through scrolling". That workaround made
+  /// `documentSize.height` enormous, broke `verticalCacheExtent`
+  /// neighbour prefetch, and confused matrix-distance heuristics.
+  /// Single-page mode does the same thing natively and cheaply:
+  ///
+  /// - **Layout**: only the current page's `Rect` is non-zero;
+  ///   all other pages get `Rect.zero` so the existing paint /
+  ///   intersection / hit-test code skips them automatically.
+  /// - **Matrix**: clamped to the single-page document size, so the
+  ///   user cannot scroll to a different page by panning.
+  /// - **Render cache**: the in-memory tile cache holds the current
+  ///   page; the neighbour-prefetch hook (F2) warms `N±1`/`N±2`
+  ///   in the on-disk [renderCache] (when wired) so a `goToPage`
+  ///   call paints nearly instantly from disk on smart-board hardware.
+  /// - **Eviction**: distance is measured in *page-number space*
+  ///   (the geometric distance is degenerate when N-1 pages share
+  ///   `Rect.zero`).
+  ///
+  /// `false` (default) preserves the original multi-page scrollable
+  /// behaviour upstream pdfrx ships with. The flag is an opt-in
+  /// switch — turning it on does NOT change any other parameter
+  /// behaviour, and turning it off restores stock scrolling.
+  final bool singlePageMode;
+
   /// The horizontal cache extent specified in ratio to the viewport width. The default is 1.0.
   final double horizontalCacheExtent;
 
@@ -463,6 +551,23 @@ class PdfViewerParams {
   /// },
   /// ```
   final PdfPageOverlaysBuilder? pageOverlaysBuilder;
+
+  /// Optional builder for a per-page "still loading" placeholder.
+  ///
+  /// ARGUS fork (2026-05-14). Returned widget is mounted on top of a
+  /// visible page rect whenever the page has neither a full preview
+  /// image nor a partial render in the cache — e.g. while the lazy
+  /// metadata loader is still resolving the page, or while PDFium is
+  /// busy rendering after a navigation jump. The viewer drops the
+  /// overlay automatically as soon as either cache populates for the
+  /// page (the next invalidate-driven rebuild flips the condition).
+  ///
+  /// When `null` (the default) the viewer paints a small centred
+  /// [CircularProgressIndicator] sized at ~6 % of the page's shortest
+  /// side, clamped to a legible range — see
+  /// `_defaultLoadingPlaceholder` in `pdf_viewer.dart`.
+  final Widget Function(BuildContext context, PdfPage page, Rect pageRect)?
+      loadingPlaceholderBuilder;
 
   /// Build loading banner.
   ///
@@ -663,6 +768,7 @@ class PdfViewerParams {
         other.linkHandlerParams == linkHandlerParams &&
         other.viewerOverlayBuilder == viewerOverlayBuilder &&
         other.pageOverlaysBuilder == pageOverlaysBuilder &&
+        other.loadingPlaceholderBuilder == loadingPlaceholderBuilder &&
         other.loadingBannerBuilder == loadingBannerBuilder &&
         other.errorBannerBuilder == errorBannerBuilder &&
         other.linkWidgetBuilder == linkWidgetBuilder &&
@@ -723,6 +829,7 @@ class PdfViewerParams {
         linkHandlerParams.hashCode ^
         viewerOverlayBuilder.hashCode ^
         pageOverlaysBuilder.hashCode ^
+        loadingPlaceholderBuilder.hashCode ^
         loadingBannerBuilder.hashCode ^
         errorBannerBuilder.hashCode ^
         linkWidgetBuilder.hashCode ^

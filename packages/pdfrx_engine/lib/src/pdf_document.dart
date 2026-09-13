@@ -229,6 +229,36 @@ abstract class PdfDocument {
     Duration loadUnitDuration = const Duration(milliseconds: 250),
   });
 
+  /// ARGUS fork (2026-05-14). Sparse page-metadata load.
+  ///
+  /// Loads the [PdfPage] geometry (width / height / rotation / bounding
+  /// box) for the given 0-based page indices ONLY — already-loaded
+  /// indices are skipped. The contract differs from
+  /// [loadPagesProgressively]: that one walks the document
+  /// sequentially from the first unloaded page, which on a
+  /// `_setCurrentPageNumber(270)` jump from page 1 dragged PDFium
+  /// through `FPDF_LoadPage` 240 times in a row — every call lets
+  /// PDFium populate its internal CPDF resource cache for that page,
+  /// and on a shading-heavy textbook the cumulative growth ran
+  /// process RSS from ~500 MB up to ~800 MB in seconds.
+  ///
+  /// Backends without a native sparse implementation fall back to
+  /// [loadPagesProgressively] with a stop-once-target-reached
+  /// callback — same memory footprint as before, but the abstract
+  /// surface stays consistent. The PDFium backend overrides with a
+  /// real sparse loop.
+  Future<void> loadPagesAt(Iterable<int> zeroBasedIndices) async {
+    final List<int> indices = zeroBasedIndices.toList();
+    if (indices.isEmpty) return;
+    int maxIndex = indices.first;
+    for (final int i in indices) {
+      if (i > maxIndex) maxIndex = i;
+    }
+    await loadPagesProgressively<void>(
+      onPageLoadProgress: (loaded, total, _) => loaded < maxIndex + 1,
+    );
+  }
+
   /// Pages.
   ///
   /// The list is unmodifiable; you cannot add, remove, or replace pages directly.

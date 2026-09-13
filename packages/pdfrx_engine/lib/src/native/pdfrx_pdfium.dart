@@ -255,7 +255,21 @@ class PdfrxEntryFunctionsImpl implements PdfrxEntryFunctions {
     passwordProvider: passwordProvider,
     firstAttemptByEmptyPassword: firstAttemptByEmptyPassword,
     useProgressiveLoading: useProgressiveLoading,
-    maxSizeToCacheOnMemory: null,
+    // ARGUS fork — Phase N (2026-05-13). Force the in-memory
+    // FPDF_LoadMemDocument path for `openData` callers regardless of
+    // size. Upstream defaults `maxSizeToCacheOnMemory` to 1 MB inside
+    // openCustom, which sends 170+ MB PDFs through `PdfiumFileAccess`
+    // — a `NativeCallable.listener` round-trip that requires the
+    // **main isolate** to service every PDFium block read while the
+    // PDFium worker isolate's native thread sleeps in
+    // `SleepConditionVariableCS`. When the main isolate is awaiting
+    // the very `page.render(...)` Future that needs that read, both
+    // sides deadlock — exactly the page-1-OK / page-2-blank symptom
+    // we chased through Phase L/M. The bytes are already resident in
+    // RAM (ARGUS decrypts `.aidf` into a `Uint8List` and never
+    // writes the PDF to disk by policy), so giving PDFium a contiguous
+    // copy is free RAM-wise and removes the cross-isolate hop entirely.
+    maxSizeToCacheOnMemory: data.length,
     onDispose: onDispose,
   );
 
@@ -296,14 +310,14 @@ class PdfrxEntryFunctionsImpl implements PdfrxEntryFunctions {
     required void Function()? onDispose,
   }) {
     return openCustom(
+      // ARGUS fork — Phase I1 (2026-05-14). setRange memcpy replaces
+      // the per-byte for-loop that hung doc-open on 100+ MB PDFs.
       read: (buffer, position, size) {
         if (position + size > data.length) {
           size = data.length - position;
           if (size < 0) return -1;
         }
-        for (var i = 0; i < size; i++) {
-          buffer[i] = data[position + i];
-        }
+        buffer.setRange(0, size, data, position);
         return size;
       },
       fileSize: data.length,
@@ -705,6 +719,101 @@ class _PdfDocumentPdfium extends PdfDocument {
 
   void _notifyDocumentLoadComplete() {
     subject.add(PdfDocumentLoadCompleteEvent(this));
+  }
+
+  /// ARGUS fork (2026-05-14). Native sparse page-metadata loader.
+  /// Override of [PdfDocument.loadPagesAt] — see that docstring for
+  /// the design rationale. Filters out already-loaded indices,
+  /// hands the remainder to PDFium in a single `BackgroundWorker`
+  /// call, then rebuilds the public `pages` list with the resolved
+  /// dimensions slotted in at their respective positions.
+  @override
+  Future<void> loadPagesAt(Iterable<int> zeroBasedIndices) async {
+    if (isDisposed) return;
+    final int total = _pages.length;
+    final List<int> indices = <int>[];
+    for (final int i in zeroBasedIndices) {
+      if (i < 0 || i >= total) continue;
+      if (_pages[i].isLoaded) continue;
+      if (!indices.contains(i)) indices.add(i);
+    }
+    if (indices.isEmpty) return;
+
+    final results = await BackgroundWorker.computeWithArena<
+        ({int docAddress, List<int> indices}),
+        List<
+            ({
+              int index,
+              double width,
+              double height,
+              int rotation,
+              double bbLeft,
+              double bbBottom,
+            })>>(
+      (arena, params) {
+        final pdfium_bindings.FPDF_DOCUMENT doc =
+            pdfium_bindings.FPDF_DOCUMENT.fromAddress(params.docAddress);
+        final out = <({
+          int index,
+          double width,
+          double height,
+          int rotation,
+          double bbLeft,
+          double bbBottom,
+        })>[];
+        for (final int i in params.indices) {
+          final pdfium_bindings.FPDF_PAGE page = pdfium.FPDF_LoadPage(doc, i);
+          try {
+            final rect = arena<pdfium_bindings.FS_RECTF>();
+            pdfium.FPDF_GetPageBoundingBox(page, rect);
+            out.add((
+              index: i,
+              width: pdfium.FPDF_GetPageWidthF(page),
+              height: pdfium.FPDF_GetPageHeightF(page),
+              rotation: pdfium.FPDFPage_GetRotation(page),
+              bbLeft: rect.ref.left.toDouble(),
+              bbBottom: rect.ref.bottom.toDouble(),
+            ));
+          } finally {
+            pdfium.FPDF_ClosePage(page);
+          }
+        }
+        return out;
+      },
+      (docAddress: document.address, indices: indices),
+    );
+
+    if (isDisposed) return;
+
+    // Replace just the loaded indices in the pages list; the
+    // remaining placeholder entries stay placeholders. The whole
+    // list is reassigned because `_pages` is internally `final` —
+    // the setter handles eviction-event plumbing.
+    final List<PdfPage> updated = List<PdfPage>.from(_pages);
+    final Map<int, PdfPageStatusChange> stateChanges =
+        <int, PdfPageStatusChange>{};
+    for (final r in results) {
+      final PdfPage replacement = _PdfPagePdfium._(
+        document: this,
+        pageNumber: r.index + 1,
+        width: r.width,
+        height: r.height,
+        rotation: PdfPageRotation.values[r.rotation],
+        bbLeft: r.bbLeft,
+        bbBottom: r.bbBottom,
+        isLoaded: true,
+      );
+      updated[r.index] = replacement;
+      stateChanges[r.index + 1] =
+          PdfPageStatusChange.modified(page: replacement);
+    }
+    pages = updated;
+    if (stateChanges.isNotEmpty) {
+      subject.add(PdfDocumentPageStatusChangedEvent(
+        this,
+        changes: stateChanges,
+      ));
+    }
   }
 
   /// Loads pages in the document in a time-limited manner.

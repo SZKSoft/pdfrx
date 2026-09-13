@@ -235,7 +235,7 @@ class PdfDocumentRefFile extends PdfDocumentRef {
 /// For [allowDataOwnershipTransfer], see [PdfDocument.openData].
 class PdfDocumentRefData extends PdfDocumentRef {
   PdfDocumentRefData(
-    this.data, {
+    Uint8List data, {
     required String sourceName,
     this.passwordProvider,
     this.firstAttemptByEmptyPassword = true,
@@ -244,9 +244,19 @@ class PdfDocumentRefData extends PdfDocumentRef {
     this.onDispose,
     this.useProgressiveLoading = true,
     PdfDocumentRefKey? key,
-  }) : super(key: key ?? PdfDocumentRefKey(sourceName));
+  })  : _data = data,
+        super(key: key ?? PdfDocumentRefKey(sourceName));
 
-  final Uint8List data;
+  // ARGUS fork (2026-05-14). The backing field is mutable + nullable
+  // so [loadDocument] can release the Dart-side `Uint8List` reference
+  // the moment PDFium's native heap has its own malloc'd copy. For a
+  // 170 MB `.aidf` PDF this prevents the bytes from being pinned in
+  // Dart heap *and* native heap simultaneously — the saving on a 4 GB
+  // smart board is roughly 170 MB of resident set. Upstream callers
+  // observe `data` only before load; once the listenable's document is
+  // set, `data` is no longer needed.
+  Uint8List? _data;
+  Uint8List? get data => _data;
   @override
   final PdfPasswordProvider? passwordProvider;
   @override
@@ -260,8 +270,15 @@ class PdfDocumentRefData extends PdfDocumentRef {
   @override
   Future<PdfDocument> loadDocument(PdfDocumentLoaderProgressCallback progressCallback) async {
     await pdfrxFlutterInitialize();
-    return await PdfDocument.openData(
-      data,
+    final Uint8List? local = _data;
+    if (local == null) {
+      throw StateError(
+        'PdfDocumentRefData.loadDocument called twice — the source bytes '
+        'were released after the first successful load.',
+      );
+    }
+    final PdfDocument document = await PdfDocument.openData(
+      local,
       passwordProvider: passwordProvider,
       firstAttemptByEmptyPassword: firstAttemptByEmptyPassword,
       useProgressiveLoading: useProgressiveLoading,
@@ -269,6 +286,19 @@ class PdfDocumentRefData extends PdfDocumentRef {
       allowDataOwnershipTransfer: allowDataOwnershipTransfer,
       onDispose: onDispose,
     );
+    // PDFium has now copied the bytes into its own malloc'd buffer
+    // (see [_openData] in pdfrx_pdfium.dart — Phase N1 forces the
+    // in-memory FPDF_LoadMemDocument path which malloc's a native
+    // buffer of `data.length` and `setRange`s the Dart bytes into it).
+    // Drop the Dart reference so GC can reclaim the original Uint8List
+    // — about 170 MB for a typical .aidf payload.
+    final int dropped = local.length;
+    _data = null;
+    // ignore: avoid_print
+    print('[ARGUS-MEM] pdfrx PdfDocumentRefData dropped Dart `data` '
+        'ref ($dropped bytes) after PDFium load — only the native '
+        'malloc buffer is retained');
+    return document;
   }
 }
 
