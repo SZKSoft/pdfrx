@@ -30,10 +30,19 @@ class BackgroundWorker {
       _sendPort = await receivePort.first as SendPort;
 
       // propagate the pdfium module path to the worker
-      _compute((params) {
-        Pdfrx.pdfiumModulePath = params.modulePath;
-        Pdfrx.pdfiumNativeBindings = params.bindings;
-      }, (modulePath: Pdfrx.pdfiumModulePath, bindings: Pdfrx.pdfiumNativeBindings));
+      //
+      // ARGUS fork (2026-09-22): sent directly on the fresh port and awaited. Going through `_compute` added an
+      // `await _ensureInit()` hop, so the caller's first request reached the worker BEFORE this one and ran with a
+      // null module path (measured: the first `compute` saw null, the second saw the path). The first request is
+      // `FPDF_InitLibraryWithConfig`, so PDFium was looked up in the process, the worker threw and every pure-Dart
+      // user (the package's own tests) hung.
+      await _sendComputeParamsNoInit(
+        _sendPort!,
+        (sendPort) => _ExecuteParams(sendPort, (params) {
+          Pdfrx.pdfiumModulePath = params.modulePath;
+          Pdfrx.pdfiumNativeBindings = params.bindings;
+        }, (modulePath: Pdfrx.pdfiumModulePath, bindings: Pdfrx.pdfiumNativeBindings)),
+      );
     });
     return _sendPort!;
   }

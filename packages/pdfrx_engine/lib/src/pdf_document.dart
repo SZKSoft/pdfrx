@@ -109,6 +109,38 @@ abstract class PdfDocument {
     onDispose: onDispose,
   );
 
+  /// ARGUS fork (2026-09-22). Opening the PDF from native memory WITHOUT copying it, taking ownership of the buffer.
+  ///
+  /// [address] and [size] describe a buffer outside the Dart heap (e.g. from `malloc`) that holds the whole PDF
+  /// file. [openData] copies its [Uint8List] into native memory on the calling isolate; this function hands the
+  /// caller's buffer to PDFium as-is, so a background isolate can produce the buffer and pass only its address to
+  /// the UI isolate.
+  ///
+  /// Ownership passes to pdfrx on call: [release] is called exactly once, after the document is disposed or when
+  /// opening fails. The buffer must stay valid and unmodified until then.
+  ///
+  /// [sourceName] must be some ID, e.g., file name or URL, to identify the source of the PDF. If [sourceName] is not
+  /// unique for each source, the viewer may not work correctly.
+  ///
+  /// Only the native PDFium backend supports this; other backends call [release] and throw [UnimplementedError].
+  static Future<PdfDocument> openNativeMemory({
+    required int address,
+    required int size,
+    required String sourceName,
+    required void Function() release,
+    PdfPasswordProvider? passwordProvider,
+    bool firstAttemptByEmptyPassword = true,
+    bool useProgressiveLoading = false,
+  }) => PdfrxEntryFunctions.instance.openNativeMemory(
+    address: address,
+    size: size,
+    sourceName: sourceName,
+    release: release,
+    passwordProvider: passwordProvider,
+    firstAttemptByEmptyPassword: firstAttemptByEmptyPassword,
+    useProgressiveLoading: useProgressiveLoading,
+  );
+
   /// Creating a new empty PDF document.
   ///
   /// [sourceName] must be some ID, e.g., file name or URL, to identify the source of the PDF. If [sourceName] is not

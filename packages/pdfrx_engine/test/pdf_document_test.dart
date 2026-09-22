@@ -1,6 +1,8 @@
+import 'dart:ffi';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:ffi/ffi.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:pdfrx_engine/pdfrx_engine.dart';
@@ -207,6 +209,58 @@ void main() {
       await testDocument(doc);
       // Verify that reads occurred with various sizes
       expect(readSizes.isNotEmpty, true, reason: 'Should have read sizes recorded');
+    });
+  });
+
+  // ARGUS fork (2026-09-22). Kept in this file on purpose: PDFium is process-global, and a second test file running
+  // concurrently registers its own worker's font callback, which the other file's worker then invokes ("Cannot
+  // invoke native callback from a different isolate").
+  group('PdfDocument.openNativeMemory', () {
+    ({int address, int size}) toNative(Uint8List bytes) {
+      final p = malloc<Uint8>(bytes.length);
+      p.asTypedList(bytes.length).setAll(0, bytes);
+      return (address: p.address, size: bytes.length);
+    }
+
+    test('opens from native memory and releases it once, after dispose', () async {
+      final buf = toNative(await testPdfFile.readAsBytes());
+      var releases = 0;
+      final doc = await PdfDocument.openNativeMemory(
+        address: buf.address,
+        size: buf.size,
+        sourceName: 'native:hello.pdf',
+        release: () {
+          releases++;
+          malloc.free(Pointer<Uint8>.fromAddress(buf.address));
+        },
+      );
+      expect(doc.sourceName, 'native:hello.pdf');
+      expect(doc.pages.length, greaterThan(0));
+      await testPage(doc, 1);
+      expect(releases, 0, reason: 'released while PDFium still reads the buffer');
+
+      await doc.dispose();
+      expect(releases, 1);
+      await doc.dispose();
+      expect(releases, 1, reason: 'a second dispose must not release again (double free)');
+    });
+
+    test('releases the buffer once when opening fails', () async {
+      final buf = toNative(Uint8List.fromList(List<int>.generate(4096, (i) => (i * 31) & 0xff)));
+      var releases = 0;
+      await expectLater(
+        PdfDocument.openNativeMemory(
+          address: buf.address,
+          size: buf.size,
+          sourceName: 'native:garbage',
+          release: () {
+            releases++;
+            malloc.free(Pointer<Uint8>.fromAddress(buf.address));
+          },
+        ),
+        throwsA(isA<PdfException>()),
+      );
+      expect(releases, 1, reason: 'a failed open must release exactly once (0 = leak, 2 = double free)');
     });
   });
 }

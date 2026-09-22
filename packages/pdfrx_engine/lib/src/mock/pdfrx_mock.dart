@@ -74,6 +74,24 @@ class PdfrxEntryFunctionsImpl implements PdfrxEntryFunctions {
   }) => unimplemented();
 
   @override
+  Future<PdfDocument> openNativeMemory({
+    required int address,
+    required int size,
+    required String sourceName,
+    required void Function() release,
+    PdfPasswordProvider? passwordProvider,
+    bool firstAttemptByEmptyPassword = true,
+    bool useProgressiveLoading = false,
+  }) async {
+    // Ownership passed to us on call: release even though we cannot open it.
+    release();
+    throw UnimplementedError(
+      'openNativeMemory() is not implemented because PdfrxEntryFunctions.instance is not initialized. '
+      'Please call pdfrxInitialize()/pdfrxFlutterInitialize() or explicitly set PdfrxEntryFunctions.instance.',
+    );
+  }
+
+  @override
   Future<PdfDocument> openFile(
     String filePath, {
     PdfPasswordProvider? passwordProvider,

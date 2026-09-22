@@ -117,6 +117,23 @@ class PdfrxCoreGraphicsEntryFunctions implements PdfrxEntryFunctions {
   }
 
   @override
+  Future<PdfDocument> openNativeMemory({
+    required int address,
+    required int size,
+    required String sourceName,
+    required void Function() release,
+    PdfPasswordProvider? passwordProvider,
+    bool firstAttemptByEmptyPassword = true,
+    bool useProgressiveLoading = false,
+  }) async {
+    // Ownership passed to us on call: release even though we cannot open it.
+    release();
+    throw UnimplementedError(
+      'openNativeMemory() is not implemented for CoreGraphics backend.',
+    );
+  }
+
+  @override
   Future<PdfDocument> openFile(
     String filePath, {
     PdfPasswordProvider? passwordProvider,

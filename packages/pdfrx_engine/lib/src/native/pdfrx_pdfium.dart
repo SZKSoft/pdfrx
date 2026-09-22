@@ -273,6 +273,53 @@ class PdfrxEntryFunctionsImpl implements PdfrxEntryFunctions {
     onDispose: onDispose,
   );
 
+  /// ARGUS fork (2026-09-22). See [PdfDocument.openNativeMemory].
+  ///
+  /// The caller's buffer goes to `FPDF_LoadMemDocument` directly: no `malloc` + copy on the calling isolate (which
+  /// [openData] needs for a [Uint8List]). PDFium reads the buffer for the document's lifetime, so it is released
+  /// only after `FPDF_CloseDocument` (the dispose callback runs after the close).
+  @override
+  Future<PdfDocument> openNativeMemory({
+    required int address,
+    required int size,
+    required String sourceName,
+    required void Function() release,
+    PdfPasswordProvider? passwordProvider,
+    bool firstAttemptByEmptyPassword = true,
+    bool useProgressiveLoading = false,
+  }) async {
+    // Exactly once: a failure after the document object exists disposes it (which calls this), and the catch
+    // below calls it again for failures before that point.
+    var released = false;
+    void releaseOnce() {
+      if (released) return;
+      released = true;
+      release();
+    }
+
+    try {
+      await _init();
+      return await _openByFunc(
+        (password) async => BackgroundWorker.computeWithArena(
+          (arena, params) => pdfium.FPDF_LoadMemDocument(
+            Pointer<Void>.fromAddress(params.address),
+            params.size,
+            params.password?.toUtf8(arena) ?? nullptr,
+          ).address,
+          (address: address, size: size, password: password),
+        ),
+        sourceName: sourceName,
+        passwordProvider: passwordProvider,
+        firstAttemptByEmptyPassword: firstAttemptByEmptyPassword,
+        useProgressiveLoading: useProgressiveLoading,
+        disposeCallback: releaseOnce,
+      );
+    } catch (e) {
+      releaseOnce();
+      rethrow;
+    }
+  }
+
   /// Generates a pseudo-unique source name for the given data using its SHA-256 hash.
   ///
   /// This may be sometimes slow for large data, so it's better to provide a meaningful source name when possible.

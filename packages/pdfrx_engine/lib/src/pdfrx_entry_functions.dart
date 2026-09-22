@@ -73,6 +73,20 @@ abstract class PdfrxEntryFunctions {
     void Function()? onDispose,
   });
 
+  /// See [PdfDocument.openNativeMemory].
+  ///
+  /// Implementations must call [release] exactly once: after the document is disposed, or when opening fails.
+  /// Backends without native memory access call [release] and throw [UnimplementedError].
+  Future<PdfDocument> openNativeMemory({
+    required int address,
+    required int size,
+    required String sourceName,
+    required void Function() release,
+    PdfPasswordProvider? passwordProvider,
+    bool firstAttemptByEmptyPassword = true,
+    bool useProgressiveLoading = false,
+  });
+
   /// See [PdfDocument.openFile].
   Future<PdfDocument> openFile(
     String filePath, {
