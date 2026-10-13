@@ -2,13 +2,18 @@ import 'pdf_point.dart';
 import 'pdf_rect.dart';
 
 /// ARGUS fork (2026-10-13). Vector page objects returned by `PdfPage.loadObjects`:
-/// PDFium path, text and image objects.
+/// PDFium path, text, image and shading objects.
 ///
 /// Coordinates are in the same space as [PdfRect] from `PdfPage.loadText`: PDF points,
 /// origin at the bottom-left of the page box. Form XObjects are flattened with their
 /// matrices, so every object is already in page space.
 class PdfPageObjects {
-  const PdfPageObjects({required this.paths, required this.texts, required this.images});
+  const PdfPageObjects({
+    required this.paths,
+    required this.texts,
+    required this.images,
+    this.shadings = const <PdfRect>[],
+  });
 
   /// Path (stroke / fill) objects in painting order.
   final List<PdfPathObject> paths;
@@ -18,6 +23,11 @@ class PdfPageObjects {
 
   /// Bounding boxes of raster image objects (their content is not vector).
   final List<PdfRect> images;
+
+  /// Bounding boxes of shading objects (`sh` operator: gradient fills, often used for shaded
+  /// bodies such as spheres or blocks). Kept separate from [images]: a shading is drawn by the
+  /// renderer, not stored as pixels.
+  final List<PdfRect> shadings;
 }
 
 /// Path segment type (PDFium `FPDF_SEGMENT_*`).

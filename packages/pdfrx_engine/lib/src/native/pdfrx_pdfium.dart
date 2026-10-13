@@ -1498,6 +1498,7 @@ class _PdfPagePdfium extends PdfPage {
         final paths = <PdfPathObject>[];
         final texts = <PdfTextObject>[];
         final images = <PdfRect>[];
+        final shadings = <PdfRect>[];
         final bbL = params.bbLeft;
         final bbB = params.bbBottom;
         final clip = params.clip;
@@ -1681,6 +1682,11 @@ class _PdfPagePdfium extends PdfPage {
                 final r = mapBounds(parent, f[0], f[1], f[2], f[3]);
                 if (intersects(r)) images.add(r);
               }
+            case pdfium_bindings.FPDF_PAGEOBJ_SHADING:
+              if (readBounds(o)) {
+                final r = mapBounds(parent, f[0], f[1], f[2], f[3]);
+                if (intersects(r)) shadings.add(r);
+              }
             case pdfium_bindings.FPDF_PAGEOBJ_FORM:
               if (depth >= 8) return;
               final n = pdfium.FPDFFormObj_CountObjects(o);
@@ -1698,7 +1704,7 @@ class _PdfPagePdfium extends PdfPage {
             final o = pdfium.FPDFPage_GetObject(page, i);
             if (o != nullptr) walk(o, identity, 0);
           }
-          return PdfPageObjects(paths: paths, texts: texts, images: images);
+          return PdfPageObjects(paths: paths, texts: texts, images: images, shadings: shadings);
         } finally {
           pdfium.FPDFText_ClosePage(textPage);
           pdfium.FPDF_ClosePage(page);
