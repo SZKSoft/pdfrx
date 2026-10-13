@@ -24,9 +24,11 @@ import '../pdf_image.dart';
 import '../pdf_link.dart';
 import '../pdf_outline_node.dart';
 import '../pdf_page.dart';
+import '../pdf_page_objects.dart';
 import '../pdf_page_proxies.dart';
 import '../pdf_page_status_change.dart';
 import '../pdf_permissions.dart';
+import '../pdf_point.dart';
 import '../pdf_rect.dart';
 import '../pdf_text.dart';
 import '../pdfrx.dart';
@@ -1477,6 +1479,239 @@ class _PdfPagePdfium extends PdfPage {
         pdfium.FPDF_ClosePage(page);
       }
     }, (docHandle: document.document.address, pageNumber: pageNumber, bbLeft: bbLeft, bbBottom: bbBottom));
+  }
+
+  /// ARGUS fork (2026-10-13). See [PdfPage.loadObjects].
+  @override
+  Future<PdfPageObjects?> loadObjects({PdfRect? clip}) async {
+    if (document.isDisposed || !isLoaded) return null;
+    return await BackgroundWorker.computeWithArena(
+      (arena, params) {
+        final doc = pdfium_bindings.FPDF_DOCUMENT.fromAddress(params.docHandle);
+        final page = pdfium.FPDF_LoadPage(doc, params.pageNumber - 1);
+        final textPage = pdfium.FPDFText_LoadPage(page);
+        final mat = arena<pdfium_bindings.FS_MATRIX>();
+        final f = arena<Float>(4);
+        final u = arena<UnsignedInt>(4);
+        final fillMode = arena<Int>();
+        final stroke = arena<Int>();
+        final paths = <PdfPathObject>[];
+        final texts = <PdfTextObject>[];
+        final images = <PdfRect>[];
+        final bbL = params.bbLeft;
+        final bbB = params.bbBottom;
+        final clip = params.clip;
+        final fs = sizeOf<Float>();
+        final us = sizeOf<UnsignedInt>();
+
+        // Matrix [a b c d e f]: x' = a*x + c*y + e, y' = b*x + d*y + f.
+        List<double> matrixOf(pdfium_bindings.FPDF_PAGEOBJECT o) {
+          if (pdfium.FPDFPageObj_GetMatrix(o, mat) == 0) return const [1, 0, 0, 1, 0, 0];
+          return [mat.ref.a, mat.ref.b, mat.ref.c, mat.ref.d, mat.ref.e, mat.ref.f];
+        }
+
+        // Applies [inner] first, then [outer].
+        List<double> compose(List<double> outer, List<double> inner) => [
+          outer[0] * inner[0] + outer[2] * inner[1],
+          outer[1] * inner[0] + outer[3] * inner[1],
+          outer[0] * inner[2] + outer[2] * inner[3],
+          outer[1] * inner[2] + outer[3] * inner[3],
+          outer[0] * inner[4] + outer[2] * inner[5] + outer[4],
+          outer[1] * inner[4] + outer[3] * inner[5] + outer[5],
+        ];
+
+        double scaleOf(List<double> m) => sqrt((m[0] * m[3] - m[1] * m[2]).abs());
+
+        int argb(int r, int g, int b, int a) => (a << 24) | (r << 16) | (g << 8) | b;
+
+        bool readColor(int Function(pdfium_bindings.FPDF_PAGEOBJECT, Pointer<UnsignedInt>, Pointer<UnsignedInt>,
+                    Pointer<UnsignedInt>, Pointer<UnsignedInt>) get, pdfium_bindings.FPDF_PAGEOBJECT o) =>
+            get(o, u, u.offset(us), u.offset(us * 2), u.offset(us * 3)) != 0;
+
+        bool intersects(PdfRect r) =>
+            clip == null ||
+            !(r.right < clip.left || r.left > clip.right || r.top < clip.bottom || r.bottom > clip.top);
+
+        // [l, b, r, t] in the space of [m]'s input mapped to page space (box-relative).
+        PdfRect mapBounds(List<double> m, double l, double b, double r, double t) {
+          var x0 = double.infinity, y0 = double.infinity, x1 = -double.infinity, y1 = -double.infinity;
+          for (final (x, y) in [(l, b), (r, b), (l, t), (r, t)]) {
+            final px = m[0] * x + m[2] * y + m[4] - bbL;
+            final py = m[1] * x + m[3] * y + m[5] - bbB;
+            x0 = min(x0, px);
+            x1 = max(x1, px);
+            y0 = min(y0, py);
+            y1 = max(y1, py);
+          }
+          return PdfRect(x0, y1, x1, y0);
+        }
+
+        bool readBounds(pdfium_bindings.FPDF_PAGEOBJECT o) =>
+            pdfium.FPDFPageObj_GetBounds(o, f, f.offset(fs), f.offset(fs * 2), f.offset(fs * 3)) != 0;
+
+        void addPath(pdfium_bindings.FPDF_PAGEOBJECT o, List<double> m, List<double> parent) {
+          final n = pdfium.FPDFPath_CountSegments(o);
+          if (n <= 0) return;
+          final types = <PdfPathSegmentType>[];
+          final pts = <double>[];
+          final closes = <bool>[];
+          var x0 = double.infinity, y0 = double.infinity, x1 = -double.infinity, y1 = -double.infinity;
+          for (var i = 0; i < n; i++) {
+            final seg = pdfium.FPDFPath_GetPathSegment(o, i);
+            if (seg == nullptr) continue;
+            final type = switch (pdfium.FPDFPathSegment_GetType(seg)) {
+              pdfium_bindings.FPDF_SEGMENT_MOVETO => PdfPathSegmentType.moveTo,
+              pdfium_bindings.FPDF_SEGMENT_LINETO => PdfPathSegmentType.lineTo,
+              pdfium_bindings.FPDF_SEGMENT_BEZIERTO => PdfPathSegmentType.bezierTo,
+              _ => null,
+            };
+            if (type == null || pdfium.FPDFPathSegment_GetPoint(seg, f, f.offset(fs)) == 0) continue;
+            final x = f[0], y = f[1];
+            final px = m[0] * x + m[2] * y + m[4] - bbL;
+            final py = m[1] * x + m[3] * y + m[5] - bbB;
+            types.add(type);
+            pts
+              ..add(px)
+              ..add(py);
+            closes.add(pdfium.FPDFPathSegment_GetClose(seg) != 0);
+            x0 = min(x0, px);
+            x1 = max(x1, px);
+            y0 = min(y0, py);
+            y1 = max(y1, py);
+          }
+          if (types.isEmpty) return;
+          final bounds = PdfRect(x0, y1, x1, y0);
+          if (!intersects(bounds)) return;
+          var isStroked = false;
+          var mode = 0;
+          if (pdfium.FPDFPath_GetDrawMode(o, fillMode, stroke) != 0) {
+            mode = fillMode.value;
+            isStroked = stroke.value != 0;
+          }
+          final strokeColor = isStroked && readColor(pdfium.FPDFPageObj_GetStrokeColor, o)
+              ? argb(u[0], u[1], u[2], u[3])
+              : null;
+          final fillColor = mode != 0 && readColor(pdfium.FPDFPageObj_GetFillColor, o)
+              ? argb(u[0], u[1], u[2], u[3])
+              : null;
+          final s = scaleOf(m);
+          var width = 1.0;
+          if (pdfium.FPDFPageObj_GetStrokeWidth(o, f) != 0) width = f[0];
+          List<double>? dash;
+          var phase = 0.0;
+          final dashCount = pdfium.FPDFPageObj_GetDashCount(o);
+          if (dashCount > 0 && dashCount <= 64) {
+            final da = arena<Float>(dashCount);
+            if (pdfium.FPDFPageObj_GetDashArray(o, da, dashCount) != 0) {
+              final d = [for (var i = 0; i < dashCount; i++) da[i] * s];
+              if (d.any((v) => v > 0)) dash = d;
+            }
+            if (pdfium.FPDFPageObj_GetDashPhase(o, f) != 0) phase = f[0] * s;
+          }
+          // Clip paths are stored in the container's space (the page for top-level objects).
+          List<List<double>>? clipPaths;
+          final cp = pdfium.FPDFPageObj_GetClipPath(o);
+          if (cp != nullptr) {
+            final cn = pdfium.FPDFClipPath_CountPaths(cp);
+            for (var ci = 0; ci < cn && ci < 32; ci++) {
+              final sn = pdfium.FPDFClipPath_CountPathSegments(cp, ci);
+              final poly = <double>[];
+              for (var si = 0; si < sn; si++) {
+                final seg = pdfium.FPDFClipPath_GetPathSegment(cp, ci, si);
+                if (seg == nullptr || pdfium.FPDFPathSegment_GetPoint(seg, f, f.offset(fs)) == 0) continue;
+                poly
+                  ..add(parent[0] * f[0] + parent[2] * f[1] + parent[4] - bbL)
+                  ..add(parent[1] * f[0] + parent[3] * f[1] + parent[5] - bbB);
+              }
+              if (poly.length >= 6) (clipPaths ??= <List<double>>[]).add(poly);
+            }
+          }
+          paths.add(
+            PdfPathObject(
+              segmentTypes: types,
+              points: pts,
+              closes: closes,
+              strokeColor: strokeColor,
+              fillColor: fillColor,
+              fillMode: mode,
+              strokeWidth: width * s,
+              dashArray: dash,
+              dashPhase: phase,
+              bounds: bounds,
+              clipPaths: clipPaths,
+            ),
+          );
+        }
+
+        void addText(pdfium_bindings.FPDF_PAGEOBJECT o, List<double> m, List<double> parent) {
+          if (!readBounds(o)) return;
+          // Bounds are in the parent space (the page for top-level objects).
+          final bounds = mapBounds(parent, f[0], f[1], f[2], f[3]);
+          if (!intersects(bounds)) return;
+          var size = 0.0;
+          if (pdfium.FPDFTextObj_GetFontSize(o, f) != 0) size = f[0] * scaleOf(m);
+          var text = '';
+          final len = pdfium.FPDFTextObj_GetText(o, textPage, nullptr, 0);
+          if (len > 2) {
+            final buf = arena<pdfium_bindings.FPDF_WCHAR>(len ~/ 2 + 1);
+            pdfium.FPDFTextObj_GetText(o, textPage, buf, len);
+            text = String.fromCharCodes(buf.cast<Uint16>().asTypedList(len ~/ 2 - 1));
+          }
+          final color = readColor(pdfium.FPDFPageObj_GetFillColor, o) ? argb(u[0], u[1], u[2], u[3]) : 0xFF000000;
+          texts.add(
+            PdfTextObject(
+              text: text,
+              fontSize: size,
+              origin: PdfPoint(m[4] - bbL, m[5] - bbB),
+              fillColor: color,
+              bounds: bounds,
+            ),
+          );
+        }
+
+        void walk(pdfium_bindings.FPDF_PAGEOBJECT o, List<double> parent, int depth) {
+          final m = compose(parent, matrixOf(o));
+          switch (pdfium.FPDFPageObj_GetType(o)) {
+            case pdfium_bindings.FPDF_PAGEOBJ_PATH:
+              addPath(o, m, parent);
+            case pdfium_bindings.FPDF_PAGEOBJ_TEXT:
+              addText(o, m, parent);
+            case pdfium_bindings.FPDF_PAGEOBJ_IMAGE:
+              if (readBounds(o)) {
+                final r = mapBounds(parent, f[0], f[1], f[2], f[3]);
+                if (intersects(r)) images.add(r);
+              }
+            case pdfium_bindings.FPDF_PAGEOBJ_FORM:
+              if (depth >= 8) return;
+              final n = pdfium.FPDFFormObj_CountObjects(o);
+              for (var i = 0; i < n; i++) {
+                final c = pdfium.FPDFFormObj_GetObject(o, i);
+                if (c != nullptr) walk(c, m, depth + 1);
+              }
+          }
+        }
+
+        try {
+          const identity = <double>[1, 0, 0, 1, 0, 0];
+          final n = pdfium.FPDFPage_CountObjects(page);
+          for (var i = 0; i < n; i++) {
+            final o = pdfium.FPDFPage_GetObject(page, i);
+            if (o != nullptr) walk(o, identity, 0);
+          }
+          return PdfPageObjects(paths: paths, texts: texts, images: images);
+        } finally {
+          pdfium.FPDFText_ClosePage(textPage);
+          pdfium.FPDF_ClosePage(page);
+        }
+      },
+      (
+        docHandle: document.document.address,
+        pageNumber: pageNumber,
+        bbLeft: bbLeft,
+        bbBottom: bbBottom,
+        clip: clip,
+      ),
+    );
   }
 
   @override

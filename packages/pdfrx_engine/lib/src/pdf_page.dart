@@ -6,8 +6,10 @@ import 'pdf_document.dart';
 import 'pdf_document_event.dart';
 import 'pdf_image.dart';
 import 'pdf_link.dart';
+import 'pdf_page_objects.dart';
 import 'pdf_page_proxies.dart';
 import 'pdf_page_status_change.dart';
+import 'pdf_rect.dart';
 import 'pdf_text.dart';
 import 'pdf_text_formatter.dart';
 
@@ -88,6 +90,13 @@ abstract class PdfPage {
   ///
   /// If the page is not loaded yet (progressive loading case only), this function returns null.
   Future<PdfPageRawText?> loadText();
+
+  /// ARGUS fork (2026-10-13). Load the vector objects of the page (paths, text runs and image boxes).
+  ///
+  /// Only objects whose bounds intersect [clip] are returned when it is given. Coordinates are the
+  /// same as [loadText]. Returns null when the backend does not support it (the default) or when the
+  /// page is not loaded yet.
+  Future<PdfPageObjects?> loadObjects({PdfRect? clip}) async => null;
 
   /// Load links.
   ///
